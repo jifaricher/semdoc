@@ -760,3 +760,328 @@ fn str_col(batch: &RecordBatch, name: &str) -> Result<StringArray> {
         Ok(arr.clone())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{FieldConfig, SchemaConfig};
+
+    fn two_field_schema() -> SchemaConfig {
+        SchemaConfig {
+            table: Default::default(),
+            vector: crate::schema::VectorConfig {
+                fields: vec![VectorFieldConfig {
+                    name: "dense_vec".into(),
+                    dim: 4,
+                    source: "raw_text".into(),
+                    metric: "cosine".into(),
+                    index: "none".into(),
+                    auto_embed: true,
+                }],
+            },
+            fields: [
+                ("category".to_string(), FieldConfig { r#type: "string".into(), index: true, required: false }),
+                ("keywords".to_string(), FieldConfig { r#type: "list<string>".into(), index: false, required: false }),
+            ]
+            .into_iter()
+            .collect(),
+            plugins: Default::default(),
+        }
+    }
+
+    async fn test_store() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = lancedb::connect(dir.path().to_str().unwrap())
+            .execute()
+            .await
+            .unwrap();
+        let cfg = two_field_schema();
+        let vfs = cfg.effective_vector_fields(4);
+        let store = Store::open(conn, &cfg, &vfs).await.unwrap();
+        (dir, store)
+    }
+
+    fn parent_record(id: &str, text: &str, extra: serde_json::Map<String, Value>) -> Record {
+        Record {
+            id: id.into(),
+            raw_text: text.into(),
+            chunk_level: 0,
+            chunk_index: 0,
+            parent_doc_id: None,
+            source_path: format!("/docs/{id}.md"),
+            source_type: "file".into(),
+            extra,
+        }
+    }
+
+    fn leaf_record(parent_id: &str, idx: u32, text: &str) -> Record {
+        Record {
+            id: crate::chunker::Chunk::compute_id(parent_id, idx, text),
+            raw_text: text.into(),
+            chunk_level: 1,
+            chunk_index: idx,
+            parent_doc_id: Some(parent_id.into()),
+            source_path: String::new(),
+            source_type: "file".into(),
+            extra: Default::default(),
+        }
+    }
+
+    fn unit_vec(seed: f32) -> Vec<f32> {
+        vec![seed, 1.0 - seed, seed * 0.5, 0.25]
+    }
+
+    fn leaf_vectors(seed: f32) -> std::collections::HashMap<String, Vec<f32>> {
+        [("dense_vec".to_string(), unit_vec(seed))].into_iter().collect()
+    }
+
+    #[tokio::test]
+    async fn upsert_and_count_roundtrip() {
+        let (_dir, store) = test_store().await;
+        let mut extra = serde_json::Map::new();
+        extra.insert("category".into(), Value::String("mm".into()));
+        extra.insert("keywords".into(), serde_json::json!(["a", "b"]));
+
+        store
+            .upsert_doc(
+                parent_record("p1", "parent text", extra),
+                vec![leaf_record("p1", 0, "leaf zero"), leaf_record("p1", 1, "leaf one")],
+                &leaf_vectors(1.0),
+                &leaf_vectors(0.0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.count().await.unwrap(), 3);
+
+        // merge_insert touches only the rows present in the batch: parent +
+        // leaf 0 are updated in place, but an omitted leaf (leaf 1) stays
+        // behind — stale-chunk cleanup is the caller's job (delete_by_id).
+        store
+            .upsert_doc(
+                parent_record("p1", "parent text v2", Default::default()),
+                vec![leaf_record("p1", 0, "leaf zero")],
+                &leaf_vectors(1.0),
+                &leaf_vectors(0.0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.count().await.unwrap(), 3);
+
+        let p = store.get_by_id("p1").await.unwrap().unwrap();
+        assert_eq!(p.raw_text, "parent text v2");
+        assert_eq!(p.chunk_level, 0);
+        // The stale leaf is still queryable.
+        let stale = store
+            .get_by_id(&leaf_record("p1", 1, "leaf one").id)
+            .await
+            .unwrap();
+        assert!(stale.is_some());
+    }
+
+    #[tokio::test]
+    async fn roundtrip_scalar_and_list_fields() {
+        let (_dir, store) = test_store().await;
+        let mut extra = serde_json::Map::new();
+        extra.insert("category".into(), Value::String("sched".into()));
+        extra.insert("keywords".into(), serde_json::json!(["hugepage", "mlock"]));
+
+        store
+            .upsert_doc(
+                parent_record("p2", "text", extra),
+                vec![],
+                &leaf_vectors(0.5),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        let rec = store.get_by_id("p2").await.unwrap().unwrap();
+        assert_eq!(rec.extra["category"], Value::String("sched".into()));
+        assert_eq!(
+            rec.extra["keywords"],
+            serde_json::json!(["hugepage", "mlock"])
+        );
+    }
+
+    #[tokio::test]
+    async fn wrong_dim_vector_is_rejected() {
+        let (_dir, store) = test_store().await;
+        let bad: std::collections::HashMap<String, Vec<f32>> =
+            [("dense_vec".to_string(), vec![1.0, 2.0])].into_iter().collect();
+        let err = store
+            .upsert_doc(parent_record("p3", "t", Default::default()), vec![], &bad, &Default::default())
+            .await;
+        assert!(err.is_err());
+        assert!(format!("{:#}", err.unwrap_err()).contains("expected dim 4"));
+    }
+
+    #[tokio::test]
+    async fn ann_query_leaves_vs_all() {
+        let (_dir, store) = test_store().await;
+        let mut extra = serde_json::Map::new();
+        extra.insert("category".into(), Value::String("mm".into()));
+        let mut leaf_extra = serde_json::Map::new();
+        leaf_extra.insert("category".into(), Value::String("mm".into()));
+        let mut l0 = leaf_record("p1", 0, "leaf a");
+        l0.extra = leaf_extra.clone();
+        let mut l1 = leaf_record("p1", 1, "leaf b");
+        l1.extra = leaf_extra;
+        store
+            .upsert_doc(parent_record("p1", "parent", extra), vec![l0, l1], &leaf_vectors(1.0), &leaf_vectors(1.0))
+            .await
+            .unwrap();
+
+        // Leaves only: parents excluded.
+        let leaves = store
+            .query_leaves("dense_vec", &unit_vec(1.0), 10, None)
+            .await
+            .unwrap();
+        assert_eq!(leaves.len(), 2);
+        assert!(leaves.iter().all(|r| r.chunk_level == 1));
+        assert_eq!(leaves[0].extra["category"], Value::String("mm".into()));
+
+        // All rows: parents included.
+        let all = store
+            .query_all("dense_vec", &unit_vec(1.0), 10, None)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 3);
+
+        // Scalar pre-filter via SQL.
+        let filtered = store
+            .query_leaves("dense_vec", &unit_vec(1.0), 10, Some("category = 'mm'"))
+            .await
+            .unwrap();
+        assert_eq!(filtered.len(), 2);
+        let none = store
+            .query_leaves("dense_vec", &unit_vec(1.0), 10, Some("category = 'net'"))
+            .await
+            .unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_parents_dedups_and_maps() {
+        let (_dir, store) = test_store().await;
+        store
+            .upsert_doc(
+                parent_record("p1", "parent", Default::default()),
+                vec![leaf_record("p1", 0, "a"), leaf_record("p1", 1, "b")],
+                &leaf_vectors(1.0),
+                &leaf_vectors(0.0),
+            )
+            .await
+            .unwrap();
+        let leaves = store.get_by_id(leaf_record("p1", 0, "a").id.as_str()).await.unwrap();
+        assert!(leaves.is_some());
+
+        // Duplicate ids are deduped; missing ids are absent from the map.
+        let parents = store
+            .get_parents(&["p1".into(), "p1".into(), "missing".into()])
+            .await
+            .unwrap();
+        assert_eq!(parents.len(), 1);
+        assert_eq!(parents["p1"].raw_text, "parent");
+    }
+
+    #[tokio::test]
+    async fn sibling_chunks_window_excludes_self() {
+        let (_dir, store) = test_store().await;
+        store
+            .upsert_doc(
+                parent_record("p1", "parent", Default::default()),
+                vec![
+                    leaf_record("p1", 0, "c0"),
+                    leaf_record("p1", 1, "c1"),
+                    leaf_record("p1", 2, "c2"),
+                    leaf_record("p1", 3, "c3"),
+                ],
+                &leaf_vectors(1.0),
+                &leaf_vectors(0.0),
+            )
+            .await
+            .unwrap();
+        let sibs = store.get_sibling_chunks("p1", 1, 1).await.unwrap();
+        let idxs: Vec<u32> = sibs.iter().map(|r| r.chunk_index).collect();
+        assert_eq!(idxs, vec![0, 2]);
+        // Far hit: window excludes everything.
+        let sibs = store.get_sibling_chunks("p1", 0, 0).await.unwrap();
+        assert!(sibs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_by_id_cascades_to_leaves() {
+        let (_dir, store) = test_store().await;
+        store
+            .upsert_doc(
+                parent_record("p1", "parent", Default::default()),
+                vec![leaf_record("p1", 0, "a"), leaf_record("p1", 1, "b")],
+                &leaf_vectors(1.0),
+                &leaf_vectors(0.0),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_doc(
+                parent_record("p2", "other", Default::default()),
+                vec![leaf_record("p2", 0, "c")],
+                &leaf_vectors(0.2),
+                &leaf_vectors(0.2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(store.count().await.unwrap(), 5);
+
+        store.delete_by_id("p1").await.unwrap();
+        assert_eq!(store.count().await.unwrap(), 2);
+        assert!(store.get_by_id("p1").await.unwrap().is_none());
+        assert!(store.get_by_id("p2").await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn fts_finds_substring_terms() {
+        let (_dir, store) = test_store().await;
+        store
+            .upsert_doc(
+                parent_record("p1", "the scheduler uses EEVDF heuristics", Default::default()),
+                vec![],
+                &leaf_vectors(1.0),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_doc(
+                parent_record("p2", "memory folio batching", Default::default()),
+                vec![],
+                &leaf_vectors(0.5),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+
+        let hits = store.query_fts("eevdf", 10, None).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "p1");
+
+        let hits = store.query_fts("folio", 10, None).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "p2");
+    }
+
+    #[tokio::test]
+    async fn all_parents_returns_only_parents() {
+        let (_dir, store) = test_store().await;
+        store
+            .upsert_doc(
+                parent_record("p1", "parent", Default::default()),
+                vec![leaf_record("p1", 0, "a")],
+                &leaf_vectors(1.0),
+                &leaf_vectors(0.0),
+            )
+            .await
+            .unwrap();
+        let parents = store.all_parents().await.unwrap();
+        assert_eq!(parents.len(), 1);
+        assert_eq!(parents[0].chunk_level, 0);
+    }
+}

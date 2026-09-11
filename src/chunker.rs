@@ -442,14 +442,34 @@ mod tests {
 
     #[test]
     fn markdown_sections_split_on_h2() {
-        let md = "# Title\n\npreamble\n\n## Section A\n\ncontent A\n\n## Section B\n\ncontent B";
-        let chunks = chunk_markdown(md, "p1");
+        // Sections shorter than the coalesce threshold get merged into the
+        // next section, so each section body here must exceed it (~170 chars)
+        // to stand alone.
+        let fill = |s: &str| format!("{} {}", s, "word ".repeat(40));
+        let md = format!(
+            "# Title\n\n{}\n\n## Section A\n\n{}\n\n## Section B\n\n{}",
+            fill("preamble"),
+            fill("content A"),
+            fill("content B")
+        );
+        let chunks = chunk_markdown(&md, "p1");
         // Title + preamble → 1 chunk; Section A → 1; Section B → 1.
         assert_eq!(chunks.len(), 3, "got chunks: {:?}", chunks);
         assert!(chunks[0].text.contains("preamble"));
         assert!(chunks[0].text.contains("# Title"));
         assert!(chunks[1].text.contains("Section A"));
         assert!(chunks[2].text.contains("Section B"));
+    }
+
+    #[test]
+    fn markdown_short_sections_coalesce_into_next() {
+        // Short sections are merged forward rather than emitted as tiny
+        // chunks (the "1-line header is its own chunk" failure mode).
+        let md = "# Title\n\npreamble\n\n## A\n\nshort A\n\n## B\n\nshort B";
+        let chunks = chunk_markdown(md, "p1");
+        assert_eq!(chunks.len(), 1, "got chunks: {:?}", chunks);
+        assert!(chunks[0].text.contains("short A"));
+        assert!(chunks[0].text.contains("short B"));
     }
 
     #[test]

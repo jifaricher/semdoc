@@ -496,3 +496,436 @@ pub fn record_json(d: &Record) -> Value {
     }
     Value::Object(obj)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schema::{FieldConfig, VectorFieldConfig};
+
+    fn test_schema() -> SchemaConfig {
+        SchemaConfig {
+            table: Default::default(),
+            vector: crate::schema::VectorConfig {
+                fields: vec![VectorFieldConfig {
+                    name: "dense_vec".into(),
+                    dim: 4,
+                    source: "raw_text".into(),
+                    metric: "cosine".into(),
+                    index: "none".into(),
+                    auto_embed: true,
+                }],
+            },
+            fields: [
+                ("category".to_string(), FieldConfig { r#type: "string".into(), index: true, required: false }),
+                ("score".to_string(), FieldConfig { r#type: "float32".into(), index: true, required: false }),
+                ("priority".to_string(), FieldConfig { r#type: "int64".into(), index: false, required: false }),
+                ("verified".to_string(), FieldConfig { r#type: "bool".into(), index: false, required: false }),
+                ("keywords".to_string(), FieldConfig { r#type: "list<string>".into(), index: false, required: false }),
+                ("notes".to_string(), FieldConfig { r#type: "text".into(), index: false, required: false }),
+            ]
+            .into_iter()
+            .collect(),
+            plugins: Default::default(),
+        }
+    }
+
+    // --- from_json ---
+
+    #[test]
+    fn from_json_simple_equality() {
+        let p = Pred::from_json(&serde_json::json!({"category": "mm"})).unwrap();
+        assert_eq!(p, Pred::Eq("category".into(), Value::String("mm".into())));
+    }
+
+    #[test]
+    fn from_json_mixed_ops_become_and() {
+        let p = Pred::from_json(&serde_json::json!({
+            "category": "mm",
+            "score": {"$gte": 3}
+        }))
+        .unwrap();
+        assert!(matches!(p, Pred::And(ps) if ps.len() == 2));
+    }
+
+    #[test]
+    fn from_json_non_object_is_error() {
+        assert!(Pred::from_json(&serde_json::json!(["a"])).is_err());
+        assert!(Pred::from_json(&serde_json::json!(1)).is_err());
+    }
+
+    #[test]
+    fn from_json_unknown_operator_is_error() {
+        let p = Pred::from_json(&serde_json::json!({"score": {"$regex": "x"}}));
+        assert!(p.is_err());
+    }
+
+    #[test]
+    fn from_json_in_requires_array() {
+        assert!(Pred::from_json(&serde_json::json!({"category": {"$in": "x"}})).is_err());
+    }
+
+    #[test]
+    fn from_json_or_requires_array() {
+        assert!(Pred::from_json(&serde_json::json!({"$or": {"a": 1}})).is_err());
+    }
+
+    // --- compile ---
+
+    #[test]
+    fn compile_empty_filter_is_true() {
+        let cfg = test_schema();
+        assert_eq!(Pred::And(vec![]).compile(&cfg).unwrap(), "TRUE");
+    }
+
+    #[test]
+    fn compile_eq_string_quotes_and_escapes() {
+        let cfg = test_schema();
+        let sql = Pred::from_json(&serde_json::json!({"category": "it's"}))
+            .unwrap()
+            .compile(&cfg)
+            .unwrap();
+        assert_eq!(sql, "category = 'it''s'");
+    }
+
+    #[test]
+    fn compile_numeric_comparison() {
+        let cfg = test_schema();
+        let sql = Pred::from_json(&serde_json::json!({"score": {"$gte": 0.5}}))
+            .unwrap()
+            .compile(&cfg)
+            .unwrap();
+        assert_eq!(sql, "score >= 0.5");
+    }
+
+    #[test]
+    fn compile_int_and_bool_literals() {
+        let cfg = test_schema();
+        let sql = Pred::from_json(&serde_json::json!({"priority": {"$lt": 10}}))
+            .unwrap()
+            .compile(&cfg)
+            .unwrap();
+        assert_eq!(sql, "priority < 10");
+
+        let sql = Pred::from_json(&serde_json::json!({"verified": true}))
+            .unwrap()
+            .compile(&cfg)
+            .unwrap();
+        assert_eq!(sql, "verified = TRUE");
+    }
+
+    #[test]
+    fn compile_type_mismatch_is_error() {
+        let cfg = test_schema();
+        // string field with numeric value
+        let p = Pred::from_json(&serde_json::json!({"category": 3})).unwrap();
+        assert!(p.compile(&cfg).is_err());
+        // int64 field with string value
+        let p = Pred::from_json(&serde_json::json!({"priority": "high"})).unwrap();
+        assert!(p.compile(&cfg).is_err());
+        // bool field with string value
+        let p = Pred::from_json(&serde_json::json!({"verified": "yes"})).unwrap();
+        assert!(p.compile(&cfg).is_err());
+    }
+
+    #[test]
+    fn compile_unknown_field_is_error() {
+        let cfg = test_schema();
+        let p = Pred::from_json(&serde_json::json!({"nope": "x"})).unwrap();
+        assert!(p.compile(&cfg).is_err());
+    }
+
+    #[test]
+    fn compile_reserved_filterable_fields() {
+        let cfg = test_schema();
+        let p = Pred::from_json(&serde_json::json!({"source_path": "/a/b"})).unwrap();
+        assert_eq!(p.compile(&cfg).unwrap(), "source_path = '/a/b'");
+    }
+
+    #[test]
+    fn compile_builtin_chunk_columns() {
+        let cfg = test_schema();
+        let p = Pred::from_json(&serde_json::json!({"chunk_level": 1})).unwrap();
+        assert_eq!(p.compile(&cfg).unwrap(), "chunk_level = 1");
+        let p = Pred::from_json(&serde_json::json!({"chunk_index": {"$gte": 2}})).unwrap();
+        assert_eq!(p.compile(&cfg).unwrap(), "chunk_index >= 2");
+    }
+
+    #[test]
+    fn compile_in_and_nin() {
+        let cfg = test_schema();
+        let p = Pred::from_json(&serde_json::json!({"category": {"$in": ["mm", "net"]}})).unwrap();
+        assert_eq!(p.compile(&cfg).unwrap(), "category IN ('mm', 'net')");
+        let p = Pred::from_json(&serde_json::json!({"category": {"$nin": ["mm"]}})).unwrap();
+        assert_eq!(p.compile(&cfg).unwrap(), "category NOT IN ('mm')");
+    }
+
+    #[test]
+    fn compile_list_membership_uses_array_has() {
+        let cfg = test_schema();
+        let p = Pred::from_json(&serde_json::json!({"keywords": {"$in": ["hugepage"]}})).unwrap();
+        assert_eq!(p.compile(&cfg).unwrap(), "(array_has(keywords, 'hugepage'))");
+        let p = Pred::from_json(&serde_json::json!({"keywords": {"$nin": ["a", "b"]}})).unwrap();
+        assert_eq!(p.compile(&cfg).unwrap(), "NOT (array_has(keywords, 'a') OR array_has(keywords, 'b'))");
+        // non-string members rejected
+        let p = Pred::from_json(&serde_json::json!({"keywords": {"$in": [1]}})).unwrap();
+        assert!(p.compile(&cfg).is_err());
+    }
+
+    #[test]
+    fn compile_exists() {
+        let cfg = test_schema();
+        let p = Pred::from_json(&serde_json::json!({"category": {"$exists": true}})).unwrap();
+        assert_eq!(p.compile(&cfg).unwrap(), "category IS NOT NULL");
+        let p = Pred::from_json(&serde_json::json!({"category": {"$exists": false}})).unwrap();
+        assert_eq!(p.compile(&cfg).unwrap(), "category IS NULL");
+    }
+
+    #[test]
+    fn compile_or_nesting() {
+        let cfg = test_schema();
+        let sql = Pred::from_json(&serde_json::json!({
+            "$or": [
+                {"category": "mm"},
+                {"score": {"$gt": 0.9}, "verified": true}
+            ]
+        }))
+        .unwrap()
+        .compile(&cfg)
+        .unwrap();
+        assert_eq!(sql, "((category = 'mm') OR (score > 0.9 AND verified = TRUE))");
+    }
+
+    #[test]
+    fn compile_text_field_equality_is_allowed_by_dsl() {
+        // `text` is Utf8-backed so equality compiles; the schema docs steer
+        // users to FTS instead. Just pin the current behavior.
+        let cfg = test_schema();
+        let p = Pred::from_json(&serde_json::json!({"notes": "hello"})).unwrap();
+        assert_eq!(p.compile(&cfg).unwrap(), "notes = 'hello'");
+    }
+
+    #[test]
+    fn compile_raw_pred_is_spliced_verbatim() {
+        let cfg = test_schema();
+        let p = Pred::Raw("category LIKE 'mm%'".into());
+        assert_eq!(p.compile(&cfg).unwrap(), "category LIKE 'mm%'");
+    }
+
+    // --- ExpandTo ---
+
+    #[test]
+    fn expand_to_parse() {
+        assert_eq!(ExpandTo::parse("chunk"), ExpandTo::Chunk);
+        assert_eq!(ExpandTo::parse("auto"), ExpandTo::Auto);
+        assert_eq!(ExpandTo::parse("parent"), ExpandTo::Parent);
+        // case-insensitive default is Parent
+        assert_eq!(ExpandTo::parse("PARENT"), ExpandTo::Parent);
+        assert_eq!(ExpandTo::parse("bogus"), ExpandTo::Parent);
+    }
+
+    // --- preview / record_json ---
+
+    #[test]
+    fn preview_under_limit_unchanged() {
+        assert_eq!(preview("hello", 10), "hello");
+        assert_eq!(preview("hello", 5), "hello");
+    }
+
+    #[test]
+    fn preview_truncates_by_chars_not_bytes() {
+        // 10 CJK chars = 30 bytes but 10 chars; max 5 → 5 chars + "..."
+        let s = "零一二三四五六七八九";
+        let out = preview(s, 5);
+        assert_eq!(out.chars().count(), 5 + 3);
+        assert!(out.ends_with("..."));
+        assert_eq!(out.chars().take(5).collect::<String>(), "零一二三四");
+    }
+
+    #[test]
+    fn record_json_passthrough_and_truncation() {
+        let mut rec = Record {
+            id: "id1".into(),
+            raw_text: "short".into(),
+            chunk_level: 1,
+            chunk_index: 3,
+            parent_doc_id: Some("p1".into()),
+            source_path: "/a.md".into(),
+            source_type: "file".into(),
+            extra: [("priority".to_string(), serde_json::json!(7))].into_iter().collect(),
+        };
+        let j = record_json(&rec.clone());
+        assert_eq!(j["id"], "id1");
+        assert_eq!(j["truncated"], false);
+        assert_eq!(j["chunk_level"], 1);
+        assert_eq!(j["chunk_index"], 3);
+        assert_eq!(j["parent_doc_id"], "p1");
+        assert_eq!(j["priority"], 7);
+
+        rec.raw_text = "x".repeat(MAX_RAW_TEXT_CHARS + 10);
+        let j = record_json(&rec);
+        assert_eq!(j["truncated"], true);
+        assert_eq!(j["raw_text"].as_str().unwrap().chars().count(), MAX_RAW_TEXT_CHARS + 3);
+    }
+
+    #[test]
+    fn record_json_null_parent() {
+        let rec = Record {
+            id: "id1".into(),
+            raw_text: "t".into(),
+            chunk_level: 0,
+            chunk_index: 0,
+            parent_doc_id: None,
+            source_path: String::new(),
+            source_type: String::new(),
+            extra: Default::default(),
+        };
+        let j = record_json(&rec);
+        assert!(j["parent_doc_id"].is_null());
+    }
+
+    // --- expand_leaf_hits (needs a real Store) ---
+
+    fn leaf(parent_id: &str, idx: u32, text: &str) -> Record {
+        Record {
+            id: crate::chunker::Chunk::compute_id(parent_id, idx, text),
+            raw_text: text.into(),
+            chunk_level: 1,
+            chunk_index: idx,
+            parent_doc_id: Some(parent_id.into()),
+            source_path: "/t".into(),
+            source_type: "file".into(),
+            extra: Default::default(),
+        }
+    }
+
+    fn parent(id: &str, text: &str) -> Record {
+        Record {
+            id: id.into(),
+            raw_text: text.into(),
+            chunk_level: 0,
+            chunk_index: 0,
+            parent_doc_id: None,
+            source_path: "/t".into(),
+            source_type: "file".into(),
+            extra: Default::default(),
+        }
+    }
+
+    async fn seeded_store() -> (tempfile::TempDir, Store) {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = lancedb::connect(dir.path().to_str().unwrap())
+            .execute()
+            .await
+            .unwrap();
+        // No `text` fields here: they'd make create_indices build a
+        // multi-column FTS index, which this lancedb version rejects.
+        let cfg = SchemaConfig {
+            fields: [("category".to_string(), FieldConfig { r#type: "string".into(), index: true, required: false })]
+                .into_iter()
+                .collect(),
+            ..test_schema()
+        };
+        let vfs = cfg.effective_vector_fields(4);
+        let store = Store::open(conn, &cfg, &vfs).await.unwrap();
+        let v: std::collections::HashMap<String, Vec<f32>> =
+            [("dense_vec".to_string(), vec![1.0f32, 0.0, 0.0, 0.0])].into_iter().collect();
+        // p1: 3 leaves (multi-hit → auto expands to parent); p2: 1 leaf
+        // (single hit → auto builds a sentence window).
+        store
+            .upsert_doc(
+                parent("p1", "PARENT ONE"),
+                vec![leaf("p1", 0, "a0"), leaf("p1", 1, "a1"), leaf("p1", 2, "a2")],
+                &v,
+                &v,
+            )
+            .await
+            .unwrap();
+        store
+            .upsert_doc(
+                parent("p2", "PARENT TWO"),
+                vec![leaf("p2", 0, "b0"), leaf("p2", 1, "b1"), leaf("p2", 2, "b2")],
+                &v,
+                &v,
+            )
+            .await
+            .unwrap();
+        (dir, store)
+    }
+
+    #[tokio::test]
+    async fn expand_chunk_keeps_leaf_hits() {
+        let (_dir, store) = seeded_store().await;
+        let hits = vec![leaf("p1", 0, "a0"), leaf("p1", 2, "a2")];
+        let out = expand_leaf_hits(&store, hits.clone(), ExpandTo::Chunk).await.unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|r| r.chunk_level == 1));
+    }
+
+    #[tokio::test]
+    async fn expand_parent_collapses_siblings() {
+        let (_dir, store) = seeded_store().await;
+        let hits = vec![leaf("p1", 0, "a0"), leaf("p1", 2, "a2")];
+        let out = expand_leaf_hits(&store, hits, ExpandTo::Parent).await.unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "p1");
+        assert_eq!(out[0].raw_text, "PARENT ONE");
+        assert_eq!(out[0].chunk_level, 0);
+    }
+
+    #[tokio::test]
+    async fn expand_parent_falls_back_to_leaf_when_parent_missing() {
+        let (_dir, store) = seeded_store().await;
+        let orphan = Record {
+            parent_doc_id: Some("ghost".into()),
+            ..leaf("ghost", 0, "orphan text")
+        };
+        let out = expand_leaf_hits(&store, vec![orphan], ExpandTo::Parent).await.unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].raw_text, "orphan text");
+    }
+
+    #[tokio::test]
+    async fn expand_auto_multi_hit_takes_parent() {
+        let (_dir, store) = seeded_store().await;
+        let hits = vec![leaf("p1", 0, "a0"), leaf("p1", 1, "a1")];
+        let out = expand_leaf_hits(&store, hits, ExpandTo::Auto).await.unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].id, "p1");
+        assert_eq!(out[0].raw_text, "PARENT ONE");
+    }
+
+    #[tokio::test]
+    async fn expand_auto_single_hit_builds_sentence_window() {
+        let (_dir, store) = seeded_store().await;
+        let hit = leaf("p2", 1, "b1");
+        let out = expand_leaf_hits(&store, vec![hit], ExpandTo::Auto).await.unwrap();
+        assert_eq!(out.len(), 1);
+        // Window = hit ± 1 sibling: b0 + b1 + b2 merged in chunk order.
+        let merged = &out[0];
+        assert!(merged.raw_text.contains("b0"), "{}", merged.raw_text);
+        assert!(merged.raw_text.contains("b1"));
+        assert!(merged.raw_text.contains("b2"));
+        assert!(merged.raw_text.starts_with("b0"));
+        // id = first chunk's id; parent preserved.
+        assert_eq!(merged.id, crate::chunker::Chunk::compute_id("p2", 0, "b0"));
+        assert_eq!(merged.parent_doc_id.as_deref(), Some("p2"));
+        assert_eq!(merged.chunk_index, 0);
+    }
+
+    #[tokio::test]
+    async fn expand_auto_window_hit_is_deduped_against_later_sibling() {
+        let (_dir, store) = seeded_store().await;
+        // Hit b1 builds a window covering b0..b2; a later hit of b0 must not
+        // produce a second row.
+        let hits = vec![leaf("p2", 1, "b1"), leaf("p2", 0, "b0")];
+        let out = expand_leaf_hits(&store, hits, ExpandTo::Auto).await.unwrap();
+        assert_eq!(out.len(), 1, "got {}", out.len());
+    }
+
+    #[tokio::test]
+    async fn expand_empty_hits_is_empty() {
+        let (_dir, store) = seeded_store().await;
+        let out = expand_leaf_hits(&store, Vec::new(), ExpandTo::Parent).await.unwrap();
+        assert!(out.is_empty());
+    }
+}
