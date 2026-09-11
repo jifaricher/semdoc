@@ -267,6 +267,11 @@ pub fn preview(text: &str, max_chars: usize) -> String {
 /// Over-recall pool size for rerank (leaf chunks now — cheap).
 pub const RERANK_RECALL_K: usize = 80;
 
+/// Cap on `limit` for API requests (MCP/HTTP). Prevents a single request
+/// with limit=100000 from triggering a full-table ANN + massive response.
+/// CLI is uncapped (trusted local caller).
+pub const MAX_LIMIT: usize = 200;
+
 pub struct Engine {
     pub store: Store,
     pub embedder: crate::embedding::Embedder,
@@ -421,10 +426,45 @@ pub async fn expand_leaf_hits(
                 if out.iter().any(|r| r.id == h.id) {
                     continue;
                 }
-                // Sentence-window: hit ± 1 neighbor. Neighbors come from the
-                // parents map's sibling info — simplified: return the hit
-                // plus any sibling leaves already recalled from same parent.
-                out.push(h.clone());
+                // Single hit: sentence-window — the hit merged with its ±1
+                // sibling chunks into one synthesized record (parent_doc_id
+                // preserved; id = first chunk's id so dedup-by-id works).
+                let window = 1u32;
+                let sibs = store
+                    .get_sibling_chunks(pid, h.chunk_index, window)
+                    .await
+                    .unwrap_or_default();
+                if sibs.is_empty() {
+                    out.push(h.clone());
+                    seen.insert(pid.clone());
+                    continue;
+                }
+                let mut merged_text = String::new();
+                let mut first_id = String::new();
+                let mut first_idx = u32::MAX;
+                let mut ordered: Vec<&Record> = sibs.iter().collect();
+                ordered.push(h);
+                ordered.sort_by_key(|r| r.chunk_index);
+                for s in ordered {
+                    if !merged_text.is_empty() {
+                        merged_text.push_str("\n\n");
+                    }
+                    merged_text.push_str(&s.raw_text);
+                    if s.chunk_index < first_idx {
+                        first_idx = s.chunk_index;
+                        first_id = s.id.clone();
+                    }
+                }
+                out.push(Record {
+                    id: first_id,
+                    raw_text: merged_text,
+                    chunk_level: h.chunk_level,
+                    chunk_index: first_idx,
+                    parent_doc_id: h.parent_doc_id.clone(),
+                    source_path: h.source_path.clone(),
+                    source_type: h.source_type.clone(),
+                    extra: h.extra.clone(),
+                });
                 seen.insert(pid.clone());
             }
         }
