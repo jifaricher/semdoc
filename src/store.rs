@@ -345,7 +345,13 @@ impl Store {
         leaves_only: bool,
     ) -> Result<Vec<Record>> {
         let t = self.conn.open_table(&self.table).execute().await?;
-        let mut q = t.query().nearest_to(embedding)?;
+        // Multi-vector-column schemas must name the ANN column explicitly
+        // (lancedb errors with "More than one vector columns found" without
+        // this); single-column schemas tolerate the explicit column too.
+        let mut q = t
+            .query()
+            .nearest_to(embedding)?
+            .column(vector_column);
         if leaves_only {
             let leaf = "(chunk_level = 1 OR chunk_level IS NULL)";
             let sql = match filter_sql {
@@ -428,17 +434,72 @@ impl Store {
         Ok(())
     }
 
-    /// Fetch all parent rows (chunk_level=0). Used by the graph-data
-    /// content-matching fallback — parent counts are small (hundreds).
+    /// Cap on the content-matching fallback scan. Beyond this, the mapping
+    /// covers only the first N parents (relevance order lost anyway) and we
+    /// warn — the real fix for large KBs is a content-hash side index.
+    pub const ALL_PARENTS_CAP: usize = 50_000;
+
+    /// Fetch parent rows (chunk_level=0), capped at ALL_PARENTS_CAP.
     pub async fn all_parents(&self) -> Result<Vec<Record>> {
         let t = self.conn.open_table(&self.table).execute().await?;
         let results = t
             .query()
             .only_if("chunk_level = 0")
-            .limit(100_000)
+            .limit(Self::ALL_PARENTS_CAP)
             .execute()
             .await?;
-        records_from_stream(results, &self.scalar_fields).await
+        let out = records_from_stream(results, &self.scalar_fields).await?;
+        if out.len() >= Self::ALL_PARENTS_CAP {
+            eprintln!(
+                "[graph] all_parents hit cap {} — content-matching fallback may miss docs; \
+                 consider a content-hash side index",
+                Self::ALL_PARENTS_CAP
+            );
+        }
+        Ok(out)
+    }
+
+    /// Fetch a single row by id (leaf or parent).
+    pub async fn get_by_id(&self, id: &str) -> Result<Option<Record>> {
+        let t = self.conn.open_table(&self.table).execute().await?;
+        let results = t
+            .query()
+            .only_if(format!(
+                "id = '{}'",
+                id.replace('\'', "''")
+            ))
+            .limit(1)
+            .execute()
+            .await?;
+        let recs = records_from_stream(results, &self.scalar_fields).await?;
+        Ok(recs.into_iter().next())
+    }
+
+    /// Sibling chunks sharing a parent, sorted by chunk_index, excluding the
+    /// hit itself — used by the `auto` sentence-window expansion.
+    pub async fn get_sibling_chunks(
+        &self,
+        parent_doc_id: &str,
+        exclude_chunk_index: u32,
+        window: u32,
+    ) -> Result<Vec<Record>> {
+        let t = self.conn.open_table(&self.table).execute().await?;
+        let pid = parent_doc_id.replace('\'', "''");
+        let results = t
+            .query()
+            .only_if(format!(
+                "chunk_level = 1 AND parent_doc_id = '{pid}' \
+                 AND chunk_index >= {} AND chunk_index <= {} \
+                 AND chunk_index != {exclude_chunk_index}",
+                exclude_chunk_index.saturating_sub(window),
+                exclude_chunk_index.saturating_add(window),
+            ))
+            .limit((window as usize * 2).max(2))
+            .execute()
+            .await?;
+        let mut recs = records_from_stream(results, &self.scalar_fields).await?;
+        recs.sort_by_key(|r| r.chunk_index);
+        Ok(recs)
     }
 
     pub async fn count(&self) -> Result<usize> {

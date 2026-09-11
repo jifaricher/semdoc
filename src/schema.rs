@@ -115,6 +115,12 @@ pub enum GraphPluginConfig {
         query_timeout_secs: u64,
         #[serde(default = "default_insert_concurrency")]
         insert_concurrency: usize,
+        /// Background ainsert timeout (entity extraction is LLM-bound and
+        /// slow; defaults generous like semrag's 1h).
+        #[serde(default = "default_insert_timeout")]
+        insert_timeout_secs: u64,
+        #[serde(default = "default_delete_timeout")]
+        delete_timeout_secs: u64,
     },
     /// In-process PyO3 lightrag (feature `lightrag-embedded`).
     LightragEmbedded {
@@ -156,6 +162,12 @@ pub enum RerankPluginConfig {
 
 fn default_query_timeout() -> u64 {
     60
+}
+fn default_insert_timeout() -> u64 {
+    600
+}
+fn default_delete_timeout() -> u64 {
+    120
 }
 fn default_insert_concurrency() -> usize {
     4

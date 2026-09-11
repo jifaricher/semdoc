@@ -122,17 +122,34 @@ async fn main() -> Result<()> {
 
 async fn init(schema_path: String, db: String) -> Result<()> {
     let config = SchemaConfig::load(std::path::Path::new(&schema_path))?;
-    let default_dim = match semdoc::embedding::Embedder::load(&deploy().embedding) {
-        Ok(e) => {
-            let d = semdoc::embedding::probe_dim_from_env()
-                .await
-                .unwrap_or(1024);
-            drop(e);
-            d
-        }
-        Err(_) => 1024,
+    // Probe the actual embedder dim once. If the config has explicit vector
+    // fields, verify each auto_embed field's dim matches the embedder — a
+    // mismatch is fatal at write time anyway; failing at init is kinder.
+    let probe = match semdoc::embedding::Embedder::load(&deploy().embedding) {
+        Ok(e) => semdoc::embedding::probe_dim_from_env().await,
+        Err(_) => Err(anyhow::anyhow!("embedder unavailable")),
     };
-    let vec_fields = config.effective_vector_fields(default_dim);
+    let embedder_dim = match &probe {
+        Ok(d) => *d,
+        Err(e) => {
+            eprintln!("[init] warning: cannot probe embedder dim ({e:#}); skipping dim validation");
+            1024
+        }
+    };
+    if let Ok(actual) = probe {
+        for vf in config.vector.fields.iter().filter(|v| v.auto_embed) {
+            if vf.dim != actual {
+                anyhow::bail!(
+                    "vector column `{}`: configured dim {} != embedder output dim {} \
+                     (embedding model: check Config.toml [embedding])",
+                    vf.name,
+                    vf.dim,
+                    actual
+                );
+            }
+        }
+    }
+    let vec_fields = config.effective_vector_fields(embedder_dim);
     std::fs::create_dir_all(&db)?;
     std::fs::copy(&schema_path, format!("{db}/schema.toml"))?;
     let conn = lancedb::connect(&db).execute().await?;
@@ -246,13 +263,11 @@ pub async fn write_doc(
             leaves_vecs.push(v);
         }
         parent_vectors.insert(vf.name.clone(), parent_vec);
-        if vf.name == store.vector_fields[0].name {
-            if let Some(first) = leaves_vecs.first().cloned() {
-                leaf_vectors.insert(vf.name.clone(), first);
-            }
-            for (idx, lv) in leaves_vecs.iter().enumerate() {
-                leaf_vectors.insert(format!("{}#{}", vf.name, idx), lv.clone());
-            }
+        if let Some(first) = leaves_vecs.first().cloned() {
+            leaf_vectors.insert(vf.name.clone(), first);
+        }
+        for (idx, lv) in leaves_vecs.iter().enumerate() {
+            leaf_vectors.insert(format!("{}#{}", vf.name, idx), lv.clone());
         }
     }
 
@@ -286,10 +301,8 @@ pub async fn write_doc(
     for (i, l) in leaves.iter().enumerate() {
         let mut lv: HashMap<String, Vec<f32>> = HashMap::new();
         for vf in &store.vector_fields {
-            if vf.name == store.vector_fields[0].name {
-                if let Some(v) = leaf_vectors.get(&format!("{}#{}", vf.name, i)) {
-                    lv.insert(vf.name.clone(), v.clone());
-                }
+            if let Some(v) = leaf_vectors.get(&format!("{}#{}", vf.name, i)) {
+                lv.insert(vf.name.clone(), v.clone());
             } else if let Some(v) = parent_vectors.get(&vf.name) {
                 lv.insert(vf.name.clone(), v.clone());
             }

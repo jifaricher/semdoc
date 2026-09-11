@@ -150,6 +150,17 @@ impl Server {
                     }
                 },
                 {
+                    "name": "get_document",
+                    "description": "Fetch a single document (leaf chunk or parent doc) by id, with the FULL raw_text — unlike query results which cap raw_text at 2000 chars. Use the id from a query result; parent_doc_id on a chunk gives its full parent document.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "id": { "type": "string", "description": "Document id (from a query result)" }
+                        },
+                        "required": ["id"]
+                    }
+                },
+                {
                     "name": "stats",
                     "description": "Knowledge base statistics.",
                     "inputSchema": { "type": "object", "properties": {} }
@@ -180,7 +191,7 @@ async fn dispatch(server: &Server, name: &str, args: &Value) -> Value {
             if text.is_empty() {
                 return err("text is required");
             }
-            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+            let limit = args.get("limit").and_then(|v| v.as_u64()).unwrap_or(10).min(semdoc::query::MAX_LIMIT as u64) as usize;
             let filter = match compile_filter(server, args) {
                 Ok(f) => f,
                 Err(e) => return err(format!("invalid filter: {e:#}")),
@@ -212,6 +223,33 @@ async fn dispatch(server: &Server, name: &str, args: &Value) -> Value {
                     json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&vals).unwrap_or_default() }] })
                 }
                 Err(e) => err(format!("query failed: {e:#}")),
+            }
+        }
+        "get_document" => {
+            let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
+            if id.is_empty() {
+                return err("id is required");
+            }
+            match server.engine.store.get_by_id(id).await {
+                Ok(Some(rec)) => {
+                    let mut obj = serde_json::Map::new();
+                    obj.insert("id".into(), Value::String(rec.id.clone()));
+                    obj.insert("raw_text".into(), Value::String(rec.raw_text.clone()));
+                    obj.insert("chunk_level".into(), rec.chunk_level.into());
+                    obj.insert("chunk_index".into(), rec.chunk_index.into());
+                    obj.insert(
+                        "parent_doc_id".into(),
+                        rec.parent_doc_id.clone().map(Value::String).unwrap_or(Value::Null),
+                    );
+                    obj.insert("source_path".into(), Value::String(rec.source_path.clone()));
+                    obj.insert("source_type".into(), Value::String(rec.source_type.clone()));
+                    for (k, v) in &rec.extra {
+                        obj.insert(k.clone(), v.clone());
+                    }
+                    json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&Value::Object(obj)).unwrap_or_default() }] })
+                }
+                Ok(None) => err(format!("document not found: {id}")),
+                Err(e) => err(format!("get failed: {e:#}")),
             }
         }
         "stats" => match server.engine.store.count().await {

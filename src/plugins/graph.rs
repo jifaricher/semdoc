@@ -111,6 +111,8 @@ pub struct LightragServer {
     api_key: Option<String>,
     http: reqwest::Client,
     insert_semaphore: tokio::sync::Semaphore,
+    insert_timeout_secs: u64,
+    delete_timeout_secs: u64,
 }
 
 impl LightragServer {
@@ -118,6 +120,8 @@ impl LightragServer {
         endpoint: &str,
         api_key: Option<String>,
         insert_concurrency: usize,
+        insert_timeout_secs: u64,
+        delete_timeout_secs: u64,
     ) -> Self {
         let http = reqwest::Client::builder()
             .danger_accept_invalid_certs(
@@ -131,6 +135,8 @@ impl LightragServer {
             api_key,
             http,
             insert_semaphore: tokio::sync::Semaphore::new(insert_concurrency.max(1)),
+            insert_timeout_secs,
+            delete_timeout_secs,
         }
     }
 
@@ -174,7 +180,7 @@ impl GraphPlugin for LightragServer {
             let resp = self
                 .auth(self.http.post(&url))
                 .json(&body)
-                .timeout(std::time::Duration::from_secs(600))
+                .timeout(std::time::Duration::from_secs(self.insert_timeout_secs))
                 .send()
                 .await
                 .map_err(|e| anyhow::anyhow!("lightrag insert {doc_id}: {e}"))?;
@@ -258,12 +264,20 @@ pub async fn build_graph_plugin(
             endpoint,
             api_key_env,
             insert_concurrency,
+            insert_timeout_secs,
+            delete_timeout_secs,
             ..
         }) => {
             let api_key = api_key_env
                 .as_ref()
                 .and_then(|e| std::env::var(e).ok());
-            let plugin = LightragServer::new(endpoint, api_key, *insert_concurrency);
+            let plugin = LightragServer::new(
+                endpoint,
+                api_key,
+                *insert_concurrency,
+                *insert_timeout_secs,
+                *delete_timeout_secs,
+            );
             if let Err(e) = plugin.health().await {
                 eprintln!("[graph] lightrag-server unhealthy at startup: {e:#}");
                 eprintln!("[graph] queries will degrade to semantic search until it recovers");

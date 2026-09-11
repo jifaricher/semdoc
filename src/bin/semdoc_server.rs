@@ -13,7 +13,7 @@
 
 use anyhow::Result;
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::{get, post},
@@ -163,12 +163,14 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/documents", post(add_doc))
         .route("/documents/delete", post(delete_doc))
+        .route("/documents/:id", get(get_doc))
         .route("/query/semantic", post(query_semantic))
         .route("/query/text", post(query_text))
         .route("/query/reranked", post(query_reranked))
         .route("/query/graph", post(query_graph))
         .route("/query/hybrid", post(query_hybrid))
         .route("/stats", get(stats))
+        .route("/health", get(health))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
@@ -219,6 +221,38 @@ async fn delete_doc(
     Ok(Json(json!({"ok": true})))
 }
 
+async fn get_doc(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Resp<Value> {
+    if !auth_ok(&state, &headers) {
+        return Err((StatusCode::UNAUTHORIZED, "unauthorized".into()));
+    }
+    match state.engine.store.get_by_id(&id).await {
+        Ok(Some(rec)) => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("id".into(), Value::String(rec.id.clone()));
+            // Full raw_text — this endpoint exists to bypass the 2000-char cap.
+            obj.insert("raw_text".into(), Value::String(rec.raw_text.clone()));
+            obj.insert("chunk_level".into(), rec.chunk_level.into());
+            obj.insert("chunk_index".into(), rec.chunk_index.into());
+            obj.insert(
+                "parent_doc_id".into(),
+                rec.parent_doc_id.clone().map(Value::String).unwrap_or(Value::Null),
+            );
+            obj.insert("source_path".into(), Value::String(rec.source_path.clone()));
+            obj.insert("source_type".into(), Value::String(rec.source_type.clone()));
+            for (k, v) in &rec.extra {
+                obj.insert(k.clone(), v.clone());
+            }
+            Ok(Json(Value::Object(obj)))
+        }
+        Ok(None) => Err((StatusCode::NOT_FOUND, format!("document not found: {id}"))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))),
+    }
+}
+
 async fn query_semantic(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -231,7 +265,7 @@ async fn query_semantic(
     let expand_to = body.expand_to.as_deref().map(ExpandTo::parse).unwrap_or(ExpandTo::Chunk);
     let docs = state
         .engine
-        .query_semantic(&body.text, body.limit.unwrap_or(10), sql.as_deref(), expand_to)
+        .query_semantic(&body.text, body.limit.unwrap_or(10).min(semdoc::query::MAX_LIMIT), sql.as_deref(), expand_to)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok(Json(json!({ "documents": docs.iter().map(record_json).collect::<Vec<_>>() })))
@@ -248,7 +282,7 @@ async fn query_text(
     let sql = filter_sql(&state, &body).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let docs = state
         .engine
-        .query_fts(&body.text, body.limit.unwrap_or(10), sql.as_deref())
+        .query_fts(&body.text, body.limit.unwrap_or(10).min(semdoc::query::MAX_LIMIT), sql.as_deref())
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok(Json(json!({ "documents": docs.iter().map(record_json).collect::<Vec<_>>() })))
@@ -265,7 +299,7 @@ async fn query_reranked(
     let sql = filter_sql(&state, &body).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let docs = state
         .engine
-        .query_reranked(&body.text, body.limit.unwrap_or(10), sql.as_deref())
+        .query_reranked(&body.text, body.limit.unwrap_or(10).min(semdoc::query::MAX_LIMIT), sql.as_deref())
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok(Json(json!({ "documents": docs.iter().map(record_json).collect::<Vec<_>>() })))
@@ -279,7 +313,7 @@ async fn query_graph(
     if !auth_ok(&state, &headers) {
         return Err((StatusCode::UNAUTHORIZED, "unauthorized".into()));
     }
-    let limit = body.limit.unwrap_or(10);
+    let limit = body.limit.unwrap_or(10).min(semdoc::query::MAX_LIMIT);
     let want_answer = body.answer.unwrap_or(false);
     let sql = filter_sql(&state, &body).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let mode = if want_answer { GraphMode::Hybrid } else { GraphMode::Data };
@@ -414,7 +448,7 @@ async fn query_hybrid(
     if !auth_ok(&state, &headers) {
         return Err((StatusCode::UNAUTHORIZED, "unauthorized".into()));
     }
-    let limit = body.limit.unwrap_or(10);
+    let limit = body.limit.unwrap_or(10).min(semdoc::query::MAX_LIMIT);
     let sql = filter_sql(&state, &body).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let params = graph_params(&body);
     let want_answer = body.answer.unwrap_or(false);
@@ -527,6 +561,17 @@ async fn query_hybrid(
         "answer": answer_json,
         "graph": graph_json,
         "documents": merged,
+    })))
+}
+
+/// Liveness/readiness probe. No auth (probes don't carry tokens); no graph
+/// health call (must answer in milliseconds even when lightrag is down).
+async fn health(State(state): State<Arc<AppState>>) -> Resp<Value> {
+    let rows = state.engine.store.count().await.unwrap_or(0);
+    Ok(Json(json!({
+        "ok": true,
+        "rows": rows,
+        "graph": state.graph.name(),
     })))
 }
 
