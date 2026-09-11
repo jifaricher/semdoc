@@ -40,7 +40,7 @@ pub fn resolve_chunk_size() -> usize {
     std::env::var(CHUNK_SIZE_ENV)
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
-        .filter(|&n| n >= 64 && n <= 8192)
+        .filter(|&n| (64..=8192).contains(&n))
         .unwrap_or(DEFAULT_CHUNK_SIZE)
 }
 

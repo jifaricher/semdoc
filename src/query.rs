@@ -6,7 +6,7 @@ use anyhow::{anyhow, Result};
 use serde_json::{Map, Value};
 
 use crate::reranker::Reranker;
-use crate::schema::{FieldConfig, SchemaConfig};
+use crate::schema::SchemaConfig;
 use crate::store::{Record, Store};
 
 /// Reserved scalar columns usable in filters without being in `[fields]`.

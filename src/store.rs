@@ -14,12 +14,10 @@ use arrow::array::{
     ArrayBuilder, BooleanBuilder, FixedSizeListBuilder, Float32Builder, Int64Builder,
     ListBuilder, StringBuilder, TimestampSecondBuilder, UInt32Builder, UInt8Builder,
 };
-use arrow_array::{
-    Array, ArrayRef, FixedSizeListArray, RecordBatch, StringArray,
-};
+use arrow_array::{Array, ArrayRef, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
 use lancedb::index::scalar::{BTreeIndexBuilder, FullTextSearchQuery, FtsIndexBuilder};
-use lancedb::query::{ColumnOrdering, ExecutableQuery, QueryBase};
+use lancedb::query::{ExecutableQuery, QueryBase};
 use lancedb::index::Index as LanceIndex;
 use lancedb::Connection;
 use serde_json::Value;
@@ -157,17 +155,22 @@ impl Store {
                     .await?;
             }
         }
-        // FTS over raw_text + user `text` fields.
+        // FTS over raw_text + user `text` fields. LanceDB only supports
+        // single-column indices, so each searchable column gets its own
+        // inverted index; at query time FullTextSearchQuery without a column
+        // searches every FTS-indexed column (lance fills in a MultiMatch).
         let mut fts_cols = vec!["raw_text"];
         fts_cols.extend(config.text_fields());
-        t.create_index(&fts_cols, LanceIndex::FTS(FtsIndexBuilder::default()))
-            .execute()
-            .await
-            .or_else(|e| {
-                // FTS index on the same columns twice errors; treat as ok.
-                let msg = e.to_string();
-                if msg.contains("already exists") { Ok(()) } else { Err(e) }
-            })?;
+        for col in fts_cols {
+            t.create_index(&[col], LanceIndex::FTS(FtsIndexBuilder::default()))
+                .execute()
+                .await
+                .or_else(|e| {
+                    // FTS index on the same column twice errors; treat as ok.
+                    let msg = e.to_string();
+                    if msg.contains("already exists") { Ok(()) } else { Err(e) }
+                })?;
+        }
         // Vector indexes per config (`index != "none"`).
         for v in &self.vector_fields {
             match v.index.as_str() {
@@ -260,7 +263,7 @@ impl Store {
                 let vals = vectors
                     .get(&vf.name)
                     .ok_or_else(|| anyhow::anyhow!("missing vector for column {}", vf.name))?;
-                if vals.len() != vf.dim as usize {
+                if vals.len() != vf.dim {
                     anyhow::bail!(
                         "vector column `{}`: expected dim {}, got {}",
                         vf.name,
@@ -360,7 +363,7 @@ impl Store {
             };
             q = q.only_if(sql);
         } else if let Some(f) = filter_sql {
-            q = q.only_if(f.to_string());
+            q = q.only_if(f);
         }
         q = q.limit(limit);
         // Bring back everything we need to reconstruct records.
@@ -389,7 +392,7 @@ impl Store {
             .query()
             .full_text_search(FullTextSearchQuery::new(text.to_string()));
         if let Some(f) = filter_sql {
-            q = q.only_if(f.to_string());
+            q = q.only_if(f);
         }
         q = q.limit(limit);
         let results = q.execute().await?;
@@ -688,7 +691,7 @@ async fn records_from_stream(
 
         for i in 0..batch.num_rows() {
             let mut extra = serde_json::Map::new();
-            for (name, _) in scalar_fields {
+            for name in scalar_fields.keys() {
                 if let Some(col) = batch.column_by_name(name) {
                     if col.is_null(i) {
                         continue;
@@ -1066,6 +1069,64 @@ mod tests {
         let hits = store.query_fts("folio", 10, None).await.unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].id, "p2");
+    }
+
+    #[tokio::test]
+    async fn text_field_schema_inits_and_fts_searches_all_columns() {
+        // Regression: a schema with `text` fields used to fail at init
+        // because the FTS index was built as one multi-column index, which
+        // lancedb rejects. Each column now gets its own index, and an
+        // uncolumned FullTextSearchQuery searches all of them.
+        let dir = tempfile::tempdir().unwrap();
+        let conn = lancedb::connect(dir.path().to_str().unwrap())
+            .execute()
+            .await
+            .unwrap();
+        let cfg = SchemaConfig {
+            fields: [
+                ("summary".to_string(), FieldConfig { r#type: "text".into(), index: false, required: false }),
+                ("category".to_string(), FieldConfig { r#type: "string".into(), index: true, required: false }),
+            ]
+            .into_iter()
+            .collect(),
+            ..two_field_schema()
+        };
+        let vfs = cfg.effective_vector_fields(4);
+        let store = Store::open(conn, &cfg, &vfs).await.unwrap();
+
+        let v: std::collections::HashMap<String, Vec<f32>> =
+            [("dense_vec".to_string(), vec![1.0f32, 0.0, 0.0, 0.0])].into_iter().collect();
+        let mut extra_a = serde_json::Map::new();
+        extra_a.insert("summary".into(), Value::String("deque blocking issues".into()));
+        extra_a.insert("category".into(), Value::String("sched".into()));
+        store
+            .upsert_doc(parent_record("p1", "plain body text", extra_a), vec![], &v, &Default::default())
+            .await
+            .unwrap();
+        let mut extra_b = serde_json::Map::new();
+        extra_b.insert("summary".into(), Value::String("unrelated summary".into()));
+        extra_b.insert("category".into(), Value::String("mm".into()));
+        store
+            .upsert_doc(parent_record("p2", "another body", extra_b), vec![], &v, &Default::default())
+            .await
+            .unwrap();
+
+        // Hit in the user `text` column.
+        let hits = store.query_fts("blocking", 10, None).await.unwrap();
+        assert_eq!(hits.len(), 1, "got {:?}", hits.iter().map(|h| &h.id).collect::<Vec<_>>());
+        assert_eq!(hits[0].id, "p1");
+
+        // Hit in raw_text.
+        let hits = store.query_fts("another", 10, None).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "p2");
+
+        // Scalar prefilter combined with FTS.
+        let hits = store
+            .query_fts("blocking", 10, Some("category = 'mm'"))
+            .await
+            .unwrap();
+        assert!(hits.is_empty());
     }
 
     #[tokio::test]

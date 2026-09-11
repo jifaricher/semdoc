@@ -15,7 +15,6 @@ use anyhow::Result;
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
-    response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
@@ -106,10 +105,6 @@ fn auth_ok(state: &AppState, headers: &HeaderMap) -> bool {
     }
 }
 
-fn auth_err() -> impl IntoResponse {
-    (StatusCode::UNAUTHORIZED, "unauthorized")
-}
-
 fn filter_sql(state: &AppState, body: &QueryBody) -> Result<Option<String>, String> {
     match &body.filter {
         Some(f) if f.as_object().is_some_and(|o| !o.is_empty()) => {
@@ -145,12 +140,7 @@ async fn main() -> Result<()> {
     let graph = build_graph_plugin(&config.plugins.graph).await?;
     let token = deploy
         .server_token()
-        .or_else(|| std::env::var("SEMDOC_TOKEN").ok())
-        .or(if args.auth {
-            None // --auth set but no token found → error below
-        } else {
-            None
-        });
+        .or_else(|| std::env::var("SEMDOC_TOKEN").ok());
     if args.auth && token.is_none() {
         anyhow::bail!("--auth requires server.token_env (config) or SEMDOC_TOKEN (env)");
     }
@@ -198,7 +188,7 @@ async fn add_doc(
         extra: body.meta,
         vectors: Default::default(),
     };
-    semdoc_bin_helpers::write_doc(&state.engine.store, &state.engine.config, &state.engine.embedder, doc)
+    semdoc_bin_helpers::write_doc(&state.engine.store, &state.engine.embedder, doc)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok(Json(json!({"ok": true})))
@@ -315,7 +305,9 @@ async fn query_graph(
     }
     let limit = body.limit.unwrap_or(10).min(semdoc::query::MAX_LIMIT);
     let want_answer = body.answer.unwrap_or(false);
-    let sql = filter_sql(&state, &body).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    // Filter is validated (compile errors surface as 400) but graph queries
+    // don't consume SQL — the graph backend has its own metadata filtering.
+    let _ = filter_sql(&state, &body).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let mode = if want_answer { GraphMode::Hybrid } else { GraphMode::Data };
     let params = graph_params(&body);
     let answer = match state.graph.query(&body.text, mode, limit, &params).await {
@@ -329,7 +321,7 @@ async fn query_graph(
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
             return Ok(Json(json!({
                 "degraded": true,
-                "answer": if want_answer { Value::Null } else { Value::Null },
+                "answer": Value::Null,
                 "graph": Value::Null,
                 "documents": docs.iter().map(record_json).collect::<Vec<_>>(),
             })));
@@ -674,13 +666,11 @@ fn json_eq(a: &Value, b: &Value) -> bool {
 mod semdoc_bin_helpers {
     use anyhow::Result;
     use semdoc::embedding::Embedder;
-    use semdoc::schema::SchemaConfig;
     use semdoc::store::{InputDoc, Record, Store};
     use std::collections::HashMap;
 
     pub async fn write_doc(
         store: &Store,
-        config: &SchemaConfig,
         embedder: &Embedder,
         doc: InputDoc,
     ) -> Result<()> {

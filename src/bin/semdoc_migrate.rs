@@ -60,7 +60,7 @@ fn remap(col: &arrow_array::ArrayRef, target: &DataType, name: &str) -> anyhow::
                     b.append(false);
                 } else {
                     let off = src_arr.value_offset(i);
-                    for j in off as usize..off as usize + *len as usize {
+                    for j in off..off + *len {
                         b.values().append_value(values.value(j as usize));
                     }
                     b.append(true);
@@ -101,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Stream the whole src table and write in 1024-row chunks.
     use futures::TryStreamExt;
-    use lancedb::query::{ExecutableQuery, QueryBase};
+    use lancedb::query::ExecutableQuery;
     let stream = src_table.query().execute().await?;
     let mut stream = stream;
 

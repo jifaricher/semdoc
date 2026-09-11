@@ -111,7 +111,6 @@ impl Embedder {
 
 #[cfg(feature = "onnx")]
 pub mod onnx_impl {
-    use super::*;
     use anyhow::Result;
     use ort::session::{builder::GraphOptimizationLevel, Session};
     use ort::value::TensorRef;
