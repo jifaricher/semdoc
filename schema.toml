@@ -1,0 +1,70 @@
+# =============================================================================
+# semdoc schema 模板(库语义)
+# =============================================================================
+# 用法: semdoc init --schema schema.toml --db <db路径>
+#       init 时本文件被拷贝为 <db>/schema.toml,之后库结构以此为准。
+#
+# 本文件展示 schema.toml 的"最小默认形态":只有 [table] + 单个默认向量列。
+# [fields]/[plugins] 全部是可选的——不需要就不写。
+#
+# 注意: 空的 schema.toml(0 字节)也合法,等价于本文件取消所有注释后的形态:
+#   表名 "documents" + 单向量列 dense_vec(dim=默认 embedder 维度)
+# =============================================================================
+
+[table]
+# LanceDB 表名(每库一表)
+# 默认: "documents"
+name = "documents"
+
+# ---------------------------------------------------------------------------
+# 向量列。未写 [[vector.fields]] 时自动派生默认单列(即下面这段的值):
+#   name="dense_vec", dim=默认 embedder 维度(init 时探测,通常 1024),
+#   source="raw_text", metric="cosine", index="none", auto_embed=true
+# 显式写出即为覆盖默认;支持多列(多路检索),每列一段 [[vector.fields]]。
+# ---------------------------------------------------------------------------
+[[vector.fields]]
+name = "dense_vec"
+# 默认: init 时从配置的 embedder 探测(bge-m3 = 1024)
+dim = 1024
+# 默认: "raw_text"
+source = "raw_text"
+# 可选: "cosine"(默认) | "l2" | "dot"
+metric = "cosine"
+# 可选: "none"(默认) | "ivf_pq" | "ivf_flat"
+index = "none"
+# 默认: true(false = 只接受客户端预嵌入)
+auto_embed = true
+
+# ---------------------------------------------------------------------------
+# 用户自定义标量字段(可选)。示例:
+# [fields]
+# domain   = { type = "string",  index = true }   # index 默认 false
+# priority = { type = "int64",   index = true }
+# verified = { type = "bool" }
+# tags     = { type = "list<string>" }            # $in/$nin 成员过滤
+# notes    = { type = "text" }                    # FTS 检索 / 可作向量 source
+# score    = { type = "float32", required = true } # required 默认 false
+# 保留列(不可占用): id, raw_text, chunk_level, chunk_index,
+#                    parent_doc_id, source_path, source_type
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# 图检索插件(可选)。不写 = 禁用。
+# ---------------------------------------------------------------------------
+# [plugins.graph]
+# backend = "lightrag-server"        # "lightrag-server" | "lightrag-embedded"(需 feature)
+# endpoint = "http://127.0.0.1:9727" # lightrag-server 必填
+# api_key_env = "LIGHTRAG_API_KEY"   # 可选
+# query_timeout_secs = 60            # 默认: 60
+# insert_concurrency = 4             # 默认: 4
+# workspace = "./rag_storage"        # lightrag-embedded 专用
+
+# ---------------------------------------------------------------------------
+# rerank 插件(可选,声明用;部署细节优先读 Config.toml [rerank])
+# ---------------------------------------------------------------------------
+# [plugins.rerank]
+# backend = "tei"                    # "onnx" | "tei" | "openai"
+# endpoint = "http://192.168.1.7:8000"
+# api_key_env = "MY_TEI_KEY"
+# timeout_secs = 60                  # 默认: 60
+# model = "bge-reranker-v2-m3"       # openai 专用
