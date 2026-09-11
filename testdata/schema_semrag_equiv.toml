@@ -1,0 +1,29 @@
+# semdoc schema — 等价于 semrag 的 documents 表结构。
+#
+# 保留列(id/raw_text/chunk_level/chunk_index/parent_doc_id/source_path/
+# source_type)自动存在;semrag 的 7 个元数据列作为 [fields] 声明,
+# 与迁移后的数据一一对应。向量列 dense_vec dim=1024(bge-m3)。
+
+[table]
+name = "documents"
+
+[vector]
+fields = [
+  { name = "dense_vec", dim = 1024, source = "raw_text", metric = "cosine", index = "none" },
+]
+
+[fields]
+doc_type      = { type = "string", index = true }   # kernel_doc / test_case / feature_doc ...
+version       = { type = "string", index = true }   # e.g. olk-6.6
+subsystem     = { type = "string", index = true }   # sched / mm / cgroup ...
+feature       = { type = "string", index = true }   # mixed_qos / smt_expulsion ...
+language      = { type = "string" }                 # markdown / c / text
+function_name = { type = "string", index = true }   # 函数名文档
+# 注:language 是自由标注,不过滤;其余均可参与 Mongo-style filter。
+
+# graph 插件:semrag 同款 lightrag-server(workspace=semdoc_kernel)
+[plugins.graph]
+backend = "lightrag-server"
+endpoint = "http://127.0.0.1:9621"
+query_timeout_secs = 120
+insert_concurrency = 4
