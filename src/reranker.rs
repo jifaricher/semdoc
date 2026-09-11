@@ -347,3 +347,73 @@ struct OpenAiRerankItem {
     index: usize,
     relevance_score: f32,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn err(msg: &str) -> anyhow::Error {
+        anyhow::anyhow!("{msg}")
+    }
+
+    #[test]
+    fn transient_detection() {
+        assert!(is_transient(&err("rerank POST http://x: connection refused")));
+        assert!(is_transient(&err("rerank HTTP 500 Internal Server Error: boom")));
+        assert!(is_transient(&err("rerank HTTP 503 Service Unavailable")));
+        // 4xx is deterministic — not retried.
+        assert!(!is_transient(&err("rerank HTTP 401 Unauthorized")));
+        assert!(!is_transient(&err("rerank HTTP 404 Not Found")));
+        assert!(!is_transient(&err("rerank JSON decode: bad shape")));
+    }
+
+    #[test]
+    fn retry_returns_first_success_without_sleeping() {
+        let mut calls = 0;
+        let out = with_transient_retry(|| {
+            calls += 1;
+            Ok(vec![(1usize, 0.5f32)])
+        })
+        .unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(out, vec![(1, 0.5)]);
+    }
+
+    #[test]
+    fn retry_succeeds_after_transient_failures() {
+        let mut calls = 0;
+        let out = with_transient_retry(|| {
+            calls += 1;
+            if calls < 3 {
+                Err(err("rerank HTTP 503"))
+            } else {
+                Ok(vec![(0, 1.0)])
+            }
+        })
+        .unwrap();
+        assert_eq!(calls, 3);
+        assert_eq!(out, vec![(0, 1.0)]);
+    }
+
+    #[test]
+    fn retry_gives_up_after_two_extra_attempts() {
+        let mut calls = 0;
+        let res = with_transient_retry(|| {
+            calls += 1;
+            Err::<Vec<(usize, f32)>, _>(err("rerank HTTP 500"))
+        });
+        assert!(res.is_err());
+        assert_eq!(calls, 3, "1 initial + 2 retries");
+    }
+
+    #[test]
+    fn non_transient_error_fails_immediately() {
+        let mut calls = 0;
+        let res = with_transient_retry(|| {
+            calls += 1;
+            Err::<Vec<(usize, f32)>, _>(err("rerank HTTP 401 Unauthorized"))
+        });
+        assert!(res.is_err());
+        assert_eq!(calls, 1);
+    }
+}

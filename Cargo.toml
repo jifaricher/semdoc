@@ -36,6 +36,9 @@ default = ["onnx"]
 onnx = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
 lightrag-embedded = ["dep:pyo3"]
 
+[dev-dependencies]
+tempfile = "3"
+
 [[bin]]
 name = "semdoc"
 path = "src/bin/semdoc.rs"

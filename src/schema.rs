@@ -21,12 +21,18 @@ pub struct SchemaConfig {
     pub plugins: PluginsConfig,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TableConfig {
     /// LanceDB table name. Reserved: one table per database.
     #[serde(default = "default_table_name")]
     pub name: String,
+}
+
+impl Default for TableConfig {
+    fn default() -> Self {
+        TableConfig { name: default_table_name() }
+    }
 }
 
 fn default_table_name() -> String {
@@ -338,7 +344,7 @@ source = "raw_text"
 [[vector.fields]]
 name = "title_vec"
 dim = 768
-source = "title"
+source = "notes"
 metric = "l2"
 index = "ivf_pq"
 

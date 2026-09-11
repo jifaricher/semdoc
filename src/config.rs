@@ -390,3 +390,428 @@ fn inline_or_named_key(inline_var: &str) -> Option<String> {
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Env-var mutation is process-global; serialize every test that touches
+    /// SEMDOC_* vars (and scrub them before each use).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    const SCRUB: &[&str] = &[
+        "SEMDOC_EMBEDDER_BACKEND",
+        "SEMDOC_EMBEDDER_DIR",
+        "SEMDOC_EMBEDDER_HTTP_URL",
+        "SEMDOC_EMBEDDER_HTTP_MODEL",
+        "SEMDOC_EMBEDDER_HTTP_API_KEY",
+        "SEMDOC_EMBEDDER_HTTP_API_KEY_ENV",
+        "SEMDOC_EMBEDDER_HTTP_TIMEOUT",
+        "SEMDOC_RERANKER_BACKEND",
+        "SEMDOC_RERANKER_DIR",
+        "SEMDOC_RERANKER_HTTP_URL",
+        "SEMDOC_RERANKER_HTTP_API_KEY",
+        "SEMDOC_RERANKER_MODEL",
+        "SEMDOC_RERANKER_HTTP_TIMEOUT",
+        "SEMDOC_CHUNK_SIZE",
+        "SEMDOC_CHUNK_OVERLAP",
+        "SEMDOC_LISTEN",
+        "SEMDOC_TLS_INSECURE",
+        "SEMDOC_TEST_TOKEN",
+        "SEMDOC_TEST_API_KEY",
+        "SEMDOC_CONFIG",
+    ];
+
+    fn with_clean_env(f: impl FnOnce()) {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        for k in SCRUB {
+            std::env::remove_var(k);
+        }
+        f();
+        for k in SCRUB {
+            std::env::remove_var(k);
+        }
+    }
+
+    fn parse(raw: &str) -> anyhow::Result<DeploymentConfig> {
+        let mut cfg: DeploymentConfig = toml::from_str(raw)?;
+        cfg.apply_env_overrides()?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Parse + env-override without validate() — for configs whose defaults
+    /// (empty rerank endpoint) fail validation.
+    fn parse_unchecked(raw: &str) -> anyhow::Result<DeploymentConfig> {
+        let mut cfg: DeploymentConfig = toml::from_str(raw)?;
+        cfg.apply_env_overrides()?;
+        Ok(cfg)
+    }
+
+    // --- TOML parsing / defaults ---
+
+    #[test]
+    fn empty_toml_gives_defaults() {
+        with_clean_env(|| {
+            let cfg = parse_unchecked("").unwrap();
+            assert!(matches!(cfg.embedding, EmbeddingConfig::Http { ref url, .. } if url.is_empty()));
+            assert!(matches!(cfg.rerank, RerankConfig::Tei { ref endpoint, .. } if endpoint.is_empty()));
+            assert_eq!(cfg.chunk.size, None);
+            assert_eq!(cfg.server.listen, None);
+            assert!(!cfg.tls.insecure);
+        });
+    }
+
+    #[test]
+    fn parse_onnx_and_none_backends() {
+        // NOTE: apply_env_overrides() downgrades a file-specified
+        // `backend = "onnx"` to default http unless SEMDOC_EMBEDDER_DIR is
+        // set in the environment (current intended behavior — onnx from the
+        // env-only era required the dir env var). validate() additionally
+        // requires model.onnx to exist under the dir, so fabricate one.
+        with_clean_env(|| {
+            let dir = std::env::temp_dir().join(format!("semdoc-onnx-test-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("model.onnx"), b"fake").unwrap();
+            // Setting BACKEND=onnx keeps onnx; the effective dir then comes
+            // from SEMDOC_EMBEDDER_DIR (env wins over the file's dir).
+            std::env::set_var("SEMDOC_EMBEDDER_BACKEND", "onnx");
+            std::env::set_var("SEMDOC_EMBEDDER_DIR", dir.to_str().unwrap());
+            let cfg = parse(
+                r#"
+[rerank]
+backend = "none"
+"#,
+            )
+            .unwrap();
+            assert!(matches!(cfg.embedding, EmbeddingConfig::Onnx { .. }));
+            assert!(matches!(cfg.rerank, RerankConfig::None));
+            std::fs::remove_dir_all(&dir).ok();
+        });
+    }
+
+    #[test]
+    fn file_onnx_without_env_dir_is_downgraded_to_default_http() {
+        with_clean_env(|| {
+            let cfg = parse_unchecked(
+                r#"
+[embedding]
+backend = "onnx"
+dir = "/models/bge-m3"
+"#,
+            )
+            .unwrap();
+            assert!(matches!(cfg.embedding, EmbeddingConfig::Http { .. }));
+        });
+    }
+    #[test]
+    fn kebab_case_fields_accepted() {
+        with_clean_env(|| {
+            let cfg = parse_unchecked(
+                r#"
+[embedding]
+backend = "http"
+url = "http://embed:80/v1"
+model = "bge-m3"
+api_key_env = "SEMDOC_TEST_API_KEY"
+timeout_secs = 5
+"#,
+            )
+            .unwrap();
+            match &cfg.embedding {
+                EmbeddingConfig::Http { url, model, api_key_env, timeout_secs } => {
+                    assert_eq!(url, "http://embed:80/v1");
+                    assert_eq!(model, "bge-m3");
+                    assert_eq!(api_key_env.as_deref(), Some("SEMDOC_TEST_API_KEY"));
+                    assert_eq!(*timeout_secs, 5);
+                }
+                other => panic!("expected http embedder, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn unknown_fields_rejected() {
+        let err = toml::from_str::<DeploymentConfig>("[chunk]\nbogus = 1\n").unwrap_err();
+        assert!(err.to_string().contains("unknown field"));
+        let err = toml::from_str::<DeploymentConfig>("[server]\nbogus = 1\n").unwrap_err();
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn schema_sections_are_ignored() {
+        // A single Config.toml may also carry the schema sections as a draft.
+        with_clean_env(|| {
+            let cfg = parse_unchecked(
+                r#"
+[table]
+name = "documents"
+
+[vector]
+fields = []
+
+[fields]
+category = { type = "string" }
+
+[plugins]
+"#,
+            )
+            .unwrap();
+            assert_eq!(cfg.chunk.size, None);
+        });
+    }
+
+    // --- validate() ---
+
+    #[test]
+    fn validate_rejects_empty_rerank_endpoint() {
+        with_clean_env(|| {
+            let mut cfg = DeploymentConfig::default();
+            assert!(cfg.validate().is_err());
+        });
+    }
+
+    #[test]
+    fn validate_accepts_rerank_none_with_empty_endpoint() {
+        with_clean_env(|| {
+            let mut cfg = DeploymentConfig::default();
+            cfg.rerank = RerankConfig::None;
+            cfg.validate().unwrap();
+        });
+    }
+
+    #[test]
+    fn validate_rejects_unset_token_env() {
+        with_clean_env(|| {
+            let mut cfg = DeploymentConfig::default();
+            cfg.rerank = RerankConfig::None;
+            cfg.server.token_env = Some("SEMDOC_TEST_TOKEN".into());
+            let err = cfg.validate().unwrap_err();
+            assert!(err.to_string().contains("SEMDOC_TEST_TOKEN"), "{err}");
+            std::env::set_var("SEMDOC_TEST_TOKEN", "secret");
+            cfg.validate().unwrap();
+        });
+    }
+
+    #[test]
+    fn validate_rejects_unset_api_key_env() {
+        with_clean_env(|| {
+            let raw = r#"
+[rerank]
+backend = "tei"
+endpoint = "http://x:8000"
+api_key_env = "SEMDOC_TEST_API_KEY"
+"#;
+            assert!(parse(raw).is_err());
+            std::env::set_var("SEMDOC_TEST_API_KEY", "k");
+            parse(raw).unwrap();
+        });
+    }
+
+    #[test]
+    fn validate_chunk_size_bounds() {
+        with_clean_env(|| {
+            let mut cfg = DeploymentConfig::default();
+            cfg.rerank = RerankConfig::None;
+            cfg.chunk.size = Some(63);
+            assert!(cfg.validate().is_err());
+            cfg.chunk.size = Some(8193);
+            assert!(cfg.validate().is_err());
+            cfg.chunk.size = Some(64);
+            cfg.validate().unwrap();
+            cfg.chunk.size = Some(8192);
+            cfg.validate().unwrap();
+        });
+    }
+
+    // --- env overrides ---
+
+    #[test]
+    fn env_full_http_embedding_config() {
+        with_clean_env(|| {
+            std::env::set_var("SEMDOC_EMBEDDER_BACKEND", "http");
+            std::env::set_var("SEMDOC_EMBEDDER_HTTP_URL", "http://e:80/v1");
+            std::env::set_var("SEMDOC_EMBEDDER_HTTP_MODEL", "bge-m3");
+            std::env::set_var("SEMDOC_EMBEDDER_HTTP_TIMEOUT", "11");
+            let mut cfg = DeploymentConfig::default();
+            cfg.apply_env_overrides().unwrap();
+            match &cfg.embedding {
+                EmbeddingConfig::Http { url, model, timeout_secs, api_key_env } => {
+                    assert_eq!(url, "http://e:80/v1");
+                    assert_eq!(model, "bge-m3");
+                    assert_eq!(*timeout_secs, 11);
+                    assert!(api_key_env.is_none());
+                }
+                other => panic!("expected http embedder, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn env_http_backend_requires_url_and_model() {
+        with_clean_env(|| {
+            std::env::set_var("SEMDOC_EMBEDDER_BACKEND", "http");
+            let mut cfg = DeploymentConfig::default();
+            assert!(cfg.apply_env_overrides().is_err());
+            std::env::set_var("SEMDOC_EMBEDDER_HTTP_URL", "http://e:80/v1");
+            let mut cfg = DeploymentConfig::default();
+            assert!(cfg.apply_env_overrides().is_err());
+        });
+    }
+
+    #[test]
+    fn env_unknown_embedding_backend_is_error() {
+        with_clean_env(|| {
+            std::env::set_var("SEMDOC_EMBEDDER_BACKEND", "wat");
+            let mut cfg = DeploymentConfig::default();
+            assert!(cfg.apply_env_overrides().is_err());
+        });
+    }
+
+    #[test]
+    fn env_inline_api_key_routes_through_indirection() {
+        with_clean_env(|| {
+            std::env::set_var("SEMDOC_EMBEDDER_BACKEND", "http");
+            std::env::set_var("SEMDOC_EMBEDDER_HTTP_URL", "http://e:80/v1");
+            std::env::set_var("SEMDOC_EMBEDDER_HTTP_MODEL", "m");
+            std::env::set_var("SEMDOC_EMBEDDER_HTTP_API_KEY", "key123");
+            let mut cfg = DeploymentConfig::default();
+            cfg.apply_env_overrides().unwrap();
+            match &cfg.embedding {
+                EmbeddingConfig::Http { api_key_env, .. } => {
+                    assert_eq!(api_key_env.as_deref(), Some("SEMDOC_EMBEDDER_HTTP_API_KEY_INLINE"));
+                }
+                other => panic!("expected http embedder, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn env_rerank_legacy_http_alias_maps_to_tei() {
+        with_clean_env(|| {
+            std::env::set_var("SEMDOC_RERANKER_BACKEND", "http");
+            std::env::set_var("SEMDOC_RERANKER_HTTP_URL", "http://r:8000");
+            let mut cfg = DeploymentConfig::default();
+            cfg.apply_env_overrides().unwrap();
+            match &cfg.rerank {
+                RerankConfig::Tei { endpoint, .. } => assert_eq!(endpoint, "http://r:8000"),
+                other => panic!("expected tei reranker, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn env_rerank_requires_url() {
+        with_clean_env(|| {
+            std::env::set_var("SEMDOC_RERANKER_BACKEND", "tei");
+            let mut cfg = DeploymentConfig::default();
+            assert!(cfg.apply_env_overrides().is_err());
+        });
+    }
+
+    #[test]
+    fn env_chunk_and_server_and_tls() {
+        with_clean_env(|| {
+            std::env::set_var("SEMDOC_CHUNK_SIZE", "256");
+            std::env::set_var("SEMDOC_CHUNK_OVERLAP", "32");
+            std::env::set_var("SEMDOC_LISTEN", "0.0.0.0:9999");
+            std::env::set_var("SEMDOC_TLS_INSECURE", "1");
+            let mut cfg = DeploymentConfig::default();
+            cfg.rerank = RerankConfig::None;
+            cfg.apply_env_overrides().unwrap();
+            cfg.validate().unwrap();
+            assert_eq!(cfg.chunk.size, Some(256));
+            assert_eq!(cfg.chunk.overlap, Some(32));
+            assert_eq!(cfg.server.listen.as_deref(), Some("0.0.0.0:9999"));
+            assert!(cfg.tls.insecure);
+        });
+    }
+
+    #[test]
+    fn env_bad_chunk_size_is_error() {
+        with_clean_env(|| {
+            std::env::set_var("SEMDOC_CHUNK_SIZE", "abc");
+            let mut cfg = DeploymentConfig::default();
+            assert!(cfg.apply_env_overrides().is_err());
+        });
+    }
+
+    // --- file loading ---
+
+    #[test]
+    fn load_missing_explicit_file_is_error() {
+        with_clean_env(|| {
+            assert!(DeploymentConfig::load(Some("/nonexistent/Config.toml")).is_err());
+        });
+    }
+
+    #[test]
+    fn load_missing_default_file_uses_defaults_then_fails_validate() {
+        // ./Config.toml in the crate root exists, so chdir into a temp dir.
+        // std::env::set_current_dir is also process-global — reuse the lock.
+        with_clean_env(|| {
+            let tmp = std::env::temp_dir().join(format!("semdoc-cfg-test-{}", std::process::id()));
+            std::fs::create_dir_all(&tmp).unwrap();
+            let prev = std::env::current_dir().unwrap();
+            std::env::set_current_dir(&tmp).unwrap();
+            let result = DeploymentConfig::load(None);
+            std::env::set_current_dir(prev).unwrap();
+            std::fs::remove_dir_all(&tmp).ok();
+            // No file + no env → defaults; the default rerank endpoint is
+            // empty, which validate() rejects. load() must surface that.
+            let err = result.unwrap_err();
+            assert!(err.to_string().contains("endpoint"), "{err}");
+        });
+    }
+
+    #[test]
+    fn load_via_semdoc_config_env() {
+        with_clean_env(|| {
+            let tmp = std::env::temp_dir().join(format!("semdoc-cfg-test2-{}", std::process::id()));
+            std::fs::create_dir_all(&tmp).unwrap();
+            let path = tmp.join("my.toml");
+            std::fs::write(
+                &path,
+                r#"
+[rerank]
+backend = "none"
+
+[chunk]
+size = 300
+"#,
+            )
+            .unwrap();
+            std::env::set_var("SEMDOC_CONFIG", path.to_str().unwrap());
+            let cfg = DeploymentConfig::load(None).unwrap();
+            assert_eq!(cfg.chunk.size, Some(300));
+            assert!(matches!(cfg.rerank, RerankConfig::None));
+            std::fs::remove_dir_all(&tmp).ok();
+        });
+    }
+
+    // --- helpers ---
+
+    #[test]
+    fn server_token_reads_indirection() {
+        with_clean_env(|| {
+            let mut cfg = DeploymentConfig::default();
+            cfg.rerank = RerankConfig::None;
+            cfg.server.token_env = Some("SEMDOC_TEST_TOKEN".into());
+            std::env::set_var("SEMDOC_TEST_TOKEN", "tok");
+            assert_eq!(cfg.server_token().as_deref(), Some("tok"));
+        });
+    }
+
+    #[test]
+    fn apply_chunk_env_pushes_values() {
+        with_clean_env(|| {
+            let mut cfg = DeploymentConfig::default();
+            cfg.rerank = RerankConfig::None;
+            cfg.chunk.size = Some(700);
+            cfg.chunk.overlap = Some(70);
+            cfg.apply_chunk_env();
+            assert_eq!(std::env::var("SEMDOC_CHUNK_SIZE").unwrap(), "700");
+            assert_eq!(std::env::var("SEMDOC_CHUNK_OVERLAP").unwrap(), "70");
+        });
+    }
+}

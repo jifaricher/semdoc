@@ -5658,6 +5658,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokenizers",
  "tokio",
