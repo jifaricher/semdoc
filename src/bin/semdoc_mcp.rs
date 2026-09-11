@@ -8,7 +8,7 @@
 use anyhow::Result;
 use clap::Parser;
 use serde_json::{json, Value};
-use std::io::{BufRead, Write};
+use std::io::Write;
 
 use semdoc::embedding::Embedder;
 use semdoc::query::{record_json, Engine, ExpandTo};
@@ -47,7 +47,7 @@ impl Server {
             vec_fields.clone(),
             config.fields.clone(),
         );
-        let deploy = semdoc::config::DeploymentConfig::load(deploy_config.as_deref())?;
+        let deploy = semdoc::config::DeploymentConfig::load(deploy_config)?;
         deploy.apply_chunk_env();
         let embedder = Embedder::load(&deploy.embedding)?;
         let reranker = if with_rerank {

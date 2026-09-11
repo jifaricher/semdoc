@@ -126,7 +126,7 @@ async fn init(schema_path: String, db: String) -> Result<()> {
     // fields, verify each auto_embed field's dim matches the embedder — a
     // mismatch is fatal at write time anyway; failing at init is kinder.
     let probe = match semdoc::embedding::Embedder::load(&deploy().embedding) {
-        Ok(e) => semdoc::embedding::probe_dim_from_env().await,
+        Ok(_) => semdoc::embedding::probe_dim_from_env().await,
         Err(_) => Err(anyhow::anyhow!("embedder unavailable")),
     };
     let embedder_dim = match &probe {
@@ -202,7 +202,7 @@ async fn add(db: String, file: Option<String>, text: Option<String>, source: Str
         extra,
         vectors: Default::default(),
     };
-    write_doc(&store, &config, &embedder, engine_inputs).await?;
+    write_doc(&store, &embedder, engine_inputs).await?;
     store.optimize_indices().await?;
     println!("added (id auto-hashed from content)");
     Ok(())
@@ -220,7 +220,6 @@ fn detect_language(path: &str, text: &str) -> String {
 /// every auto-embed vector column.
 pub async fn write_doc(
     store: &Store,
-    config: &SchemaConfig,
     embedder: &semdoc::embedding::Embedder,
     doc: InputDoc,
 ) -> Result<()> {
@@ -277,7 +276,7 @@ pub async fn write_doc(
         chunk_level: 0,
         chunk_index: 0,
         parent_doc_id: None,
-        source_path: source_path,
+        source_path,
         source_type: doc.source_type,
         extra: doc.extra,
     };

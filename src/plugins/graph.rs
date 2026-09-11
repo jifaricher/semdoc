@@ -29,7 +29,7 @@ pub struct GraphQueryParams {
 }
 
 impl GraphQueryParams {
-    fn to_body(&self) -> serde_json::Value {
+    fn to_body(self) -> serde_json::Value {
         let mut b = serde_json::Map::new();
         if let Some(v) = self.chunk_top_k {
             b.insert("chunk_top_k".into(), v.into());
@@ -198,7 +198,7 @@ impl GraphPlugin for LightragServer {
         let resp = self
             .auth(self.http.delete(&url))
             .query(&[("ids", doc_id)])
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(std::time::Duration::from_secs(self.delete_timeout_secs))
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("lightrag delete {doc_id}: {e}"))?;

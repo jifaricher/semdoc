@@ -148,6 +148,7 @@ impl DeploymentConfig {
     ///   1. explicit `path` argument
     ///   2. `SEMDOC_CONFIG` env var
     ///   3. `./Config.toml`
+    ///
     /// Missing file in cases 2/3 (and all of 1-3 absent) → defaults + env.
     pub fn load(path: Option<&str>) -> anyhow::Result<Self> {
         let file_path = path
@@ -566,7 +567,7 @@ category = { type = "string" }
     #[test]
     fn validate_rejects_empty_rerank_endpoint() {
         with_clean_env(|| {
-            let mut cfg = DeploymentConfig::default();
+            let cfg = DeploymentConfig::default();
             assert!(cfg.validate().is_err());
         });
     }
@@ -574,8 +575,7 @@ category = { type = "string" }
     #[test]
     fn validate_accepts_rerank_none_with_empty_endpoint() {
         with_clean_env(|| {
-            let mut cfg = DeploymentConfig::default();
-            cfg.rerank = RerankConfig::None;
+            let cfg = DeploymentConfig { rerank: RerankConfig::None, ..Default::default() };
             cfg.validate().unwrap();
         });
     }
@@ -583,9 +583,11 @@ category = { type = "string" }
     #[test]
     fn validate_rejects_unset_token_env() {
         with_clean_env(|| {
-            let mut cfg = DeploymentConfig::default();
-            cfg.rerank = RerankConfig::None;
-            cfg.server.token_env = Some("SEMDOC_TEST_TOKEN".into());
+            let cfg = DeploymentConfig {
+                rerank: RerankConfig::None,
+                server: ServerConfig { token_env: Some("SEMDOC_TEST_TOKEN".into()), listen: None },
+                ..Default::default()
+            };
             let err = cfg.validate().unwrap_err();
             assert!(err.to_string().contains("SEMDOC_TEST_TOKEN"), "{err}");
             std::env::set_var("SEMDOC_TEST_TOKEN", "secret");
@@ -611,16 +613,15 @@ api_key_env = "SEMDOC_TEST_API_KEY"
     #[test]
     fn validate_chunk_size_bounds() {
         with_clean_env(|| {
-            let mut cfg = DeploymentConfig::default();
-            cfg.rerank = RerankConfig::None;
-            cfg.chunk.size = Some(63);
-            assert!(cfg.validate().is_err());
-            cfg.chunk.size = Some(8193);
-            assert!(cfg.validate().is_err());
-            cfg.chunk.size = Some(64);
-            cfg.validate().unwrap();
-            cfg.chunk.size = Some(8192);
-            cfg.validate().unwrap();
+            let mk = |size: usize| DeploymentConfig {
+                rerank: RerankConfig::None,
+                chunk: ChunkConfig { size: Some(size), overlap: None },
+                ..Default::default()
+            };
+            assert!(mk(63).validate().is_err());
+            assert!(mk(8193).validate().is_err());
+            mk(64).validate().unwrap();
+            mk(8192).validate().unwrap();
         });
     }
 
@@ -716,8 +717,7 @@ api_key_env = "SEMDOC_TEST_API_KEY"
             std::env::set_var("SEMDOC_CHUNK_OVERLAP", "32");
             std::env::set_var("SEMDOC_LISTEN", "0.0.0.0:9999");
             std::env::set_var("SEMDOC_TLS_INSECURE", "1");
-            let mut cfg = DeploymentConfig::default();
-            cfg.rerank = RerankConfig::None;
+            let mut cfg = DeploymentConfig { rerank: RerankConfig::None, ..Default::default() };
             cfg.apply_env_overrides().unwrap();
             cfg.validate().unwrap();
             assert_eq!(cfg.chunk.size, Some(256));
@@ -794,9 +794,11 @@ size = 300
     #[test]
     fn server_token_reads_indirection() {
         with_clean_env(|| {
-            let mut cfg = DeploymentConfig::default();
-            cfg.rerank = RerankConfig::None;
-            cfg.server.token_env = Some("SEMDOC_TEST_TOKEN".into());
+            let cfg = DeploymentConfig {
+                rerank: RerankConfig::None,
+                server: ServerConfig { token_env: Some("SEMDOC_TEST_TOKEN".into()), listen: None },
+                ..Default::default()
+            };
             std::env::set_var("SEMDOC_TEST_TOKEN", "tok");
             assert_eq!(cfg.server_token().as_deref(), Some("tok"));
         });
@@ -805,10 +807,11 @@ size = 300
     #[test]
     fn apply_chunk_env_pushes_values() {
         with_clean_env(|| {
-            let mut cfg = DeploymentConfig::default();
-            cfg.rerank = RerankConfig::None;
-            cfg.chunk.size = Some(700);
-            cfg.chunk.overlap = Some(70);
+            let cfg = DeploymentConfig {
+                rerank: RerankConfig::None,
+                chunk: ChunkConfig { size: Some(700), overlap: Some(70) },
+                ..Default::default()
+            };
             cfg.apply_chunk_env();
             assert_eq!(std::env::var("SEMDOC_CHUNK_SIZE").unwrap(), "700");
             assert_eq!(std::env::var("SEMDOC_CHUNK_OVERLAP").unwrap(), "70");
