@@ -1,0 +1,48 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Postgres 16 + Apache AGE 1.6.0 + pgvector, built on top of the
+# official pgvector/pgvector:pg16 image.
+#
+# We use a custom Dockerfile rather than a prebuilt combined image because
+# no single well-maintained Docker Hub image bundles all three extensions
+# for PG16 at the time of writing. This mirrors the pattern used by
+# lightrag's own Dockerfile.postgres (which builds AGE on top of
+# pgvector/pgvector:pg18-trixie for PG18).
+#
+# AGE requires shared_preload_libraries=age, which we set in CMD.
+
+# Build stage: compile Apache AGE against PostgreSQL 16
+FROM pgvector/pgvector:pg16 AS build
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends --no-install-suggests \
+       ca-certificates \
+       git \
+       bison \
+       build-essential \
+       flex \
+       postgresql-server-dev-16 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Clone AGE release branch for PG16/1.6.0 and compile
+RUN git clone --depth 1 --branch release/PG16/1.6.0 \
+        https://github.com/apache/age.git /usr/src/age \
+    && cd /usr/src/age \
+    && make \
+    && make install
+
+# Final stage: copy AGE artifacts into a fresh pgvector image
+FROM pgvector/pgvector:pg16
+
+COPY --from=build /usr/lib/postgresql/16/lib/age.so /usr/lib/postgresql/16/lib/
+COPY --from=build /usr/share/postgresql/16/extension/age--*.sql /usr/share/postgresql/16/extension/
+COPY --from=build /usr/share/postgresql/16/extension/age.control /usr/share/postgresql/16/extension/
+
+# Auto-create both extensions on first boot of every new database
+RUN printf '%s\n' \
+    'CREATE EXTENSION IF NOT EXISTS vector;' \
+    'CREATE EXTENSION IF NOT EXISTS age CASCADE;' \
+    > /docker-entrypoint-initdb.d/00-create-extensions.sql
+
+# AGE must be in shared_preload_libraries or CREATE EXTENSION fails at runtime
+CMD ["postgres", "-c", "shared_preload_libraries=age"]

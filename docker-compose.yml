@@ -1,0 +1,48 @@
+# semdoc full stack: databases for lightrag + lightrag-server + semdoc-server.
+#
+#   docker compose up -d
+#   semdoc init --template generic --db /data/mydb
+#   SEMDOC_CONFIG=Config.toml ./target/release/semdoc-server --db /data/mydb --listen 0.0.0.0:8092
+#
+# The lightrag containers use the postgres image from Dockerfile.lightrag-pg
+# (PG16 + AGE + pgvector). lightrag-server needs a working LLM endpoint —
+# set LLM_BINDING_* in the environment or .env before starting it.
+
+services:
+  postgres:
+    build:
+      context: .
+      dockerfile: Dockerfile.lightrag-pg
+    image: semdoc-lightrag-pg:pg16-age-pgvector
+    container_name: semdoc-lightrag-pg
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-lightrag}
+      POSTGRES_USER: ${POSTGRES_USER:-lightrag}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - lightrag-pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lightrag -d lightrag"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    restart: unless-stopped
+
+  neo4j:
+    image: neo4j:5
+    container_name: semdoc-neo4j
+    environment:
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:-neo4j12345}
+    ports:
+      - "127.0.0.1:7474:7474"
+      - "127.0.0.1:7687:7687"
+    volumes:
+      - neo4j-data:/data
+    restart: unless-stopped
+
+volumes:
+  lightrag-pg:
+  neo4j-data:
