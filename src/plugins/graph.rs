@@ -123,10 +123,7 @@ impl LightragServer {
         insert_timeout_secs: u64,
         delete_timeout_secs: u64,
     ) -> Self {
-        let http = reqwest::Client::builder()
-            .danger_accept_invalid_certs(
-                std::env::var("SEMDOC_TLS_INSECURE").is_ok_and(|v| v == "1" || v == "true"),
-            )
+        let http = crate::tls::apply_async(reqwest::Client::builder())
             .connect_timeout(std::time::Duration::from_secs(10))
             .build()
             .expect("lightrag http client");

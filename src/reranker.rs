@@ -193,15 +193,14 @@ pub use onnx_impl::OnnxReranker;
 // ---------------------------------------------------------------------------
 
 fn http_client(timeout_secs: u64) -> reqwest::blocking::Client {
-    reqwest::blocking::Client::builder()
-        .danger_accept_invalid_certs(
-            std::env::var("SEMDOC_TLS_INSECURE").is_ok_and(|v| v == "1" || v == "true"),
-        )
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(timeout_secs))
-        .pool_idle_timeout(Duration::from_secs(0))
-        .build()
-        .expect("reranker http client build")
+    crate::tls::apply_blocking(
+        reqwest::blocking::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(timeout_secs))
+            .pool_idle_timeout(Duration::from_secs(0)),
+    )
+    .build()
+    .expect("reranker http client build")
 }
 
 /// Retry policy shared by both HTTP backends: 2 extra attempts on transient
