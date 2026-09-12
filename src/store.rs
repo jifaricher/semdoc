@@ -478,6 +478,53 @@ impl Store {
         Ok(recs.into_iter().next())
     }
 
+    /// In-place metadata update on schema-declared scalar columns (never
+    /// raw_text / vector columns — callers must enforce that; this method
+    /// also rejects names outside `scalar_fields` as defense in depth).
+    /// A JSON null value writes SQL NULL (clears the field). `cascade`
+    /// extends the predicate to all leaf chunks of the parent.
+    pub async fn update_metadata(
+        &self,
+        id: &str,
+        updates: &[(String, serde_json::Value)],
+        cascade: bool,
+    ) -> Result<usize> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        let predicate = if cascade {
+            format!(
+                "id = '{0}' OR parent_doc_id = '{0}'",
+                id.replace('\'', "''")
+            )
+        } else {
+            format!("id = '{}'", id.replace('\'', "''"))
+        };
+        let t = self.conn.open_table(&self.table).execute().await?;
+        let mut builder = t.update().only_if(predicate);
+        for (name, v) in updates {
+            if !self.scalar_fields.contains_key(name) {
+                anyhow::bail!("field `{name}` is not declared in schema [fields]");
+            }
+            builder = builder.column(name.clone(), json_value_to_sql_lit(name, v)?);
+        }
+        let res = builder.execute().await?;
+        Ok(res.rows_updated as usize)
+    }
+
+    /// Page through parent rows (chunk_level=0), offset/limit for MCP listing.
+    pub async fn list_parents(&self, limit: usize, offset: usize) -> Result<Vec<Record>> {
+        let t = self.conn.open_table(&self.table).execute().await?;
+        let results = t
+            .query()
+            .only_if("chunk_level = 0")
+            .limit(limit)
+            .offset(offset)
+            .execute()
+            .await?;
+        records_from_stream(results, &self.scalar_fields).await
+    }
+
     /// Sibling chunks sharing a parent, sorted by chunk_index, excluding the
     /// hit itself — used by the `auto` sentence-window expansion.
     pub async fn get_sibling_chunks(
@@ -742,6 +789,35 @@ async fn records_from_stream(
         }
     }
     Ok(out)
+}
+
+/// Render a JSON value as a SQL literal for `table.update().column(...)`.
+/// Type must already be validated by the caller (MCP layer checks against
+/// the schema). A JSON null becomes SQL NULL.
+fn json_value_to_sql_lit(name: &str, v: &serde_json::Value) -> Result<String> {
+    let null = || format!("{name} IS NULL");
+    match v {
+        serde_json::Value::Null => Ok(null()),
+        serde_json::Value::String(s) => Ok(format!("'{}'", s.replace('\'', "''"))),
+        serde_json::Value::Bool(b) => Ok(if *b { "TRUE" } else { "FALSE" }.to_string()),
+        serde_json::Value::Number(n) => Ok(n.to_string()),
+        serde_json::Value::Array(items) => {
+            // list<string> update: build array_select of quoted literals.
+            let mut lits = Vec::new();
+            for it in items {
+                let s = it
+                    .as_str()
+                    .ok_or_else(|| anyhow::anyhow!("list<string> items must be strings"))?;
+                lits.push(format!("'{}'", s.replace('\'', "''")));
+            }
+            if lits.is_empty() {
+                Ok(null())
+            } else {
+                Ok(format!("array_select({})", lits.join(", ")))
+            }
+        }
+        other => Err(anyhow::anyhow!("unsupported metadata value {other}")),
+    }
 }
 
 fn str_col(batch: &RecordBatch, name: &str) -> Result<StringArray> {
