@@ -535,6 +535,29 @@ impl Store {
         records_from_stream(results, &self.scalar_fields).await
     }
 
+    /// Like `list_parents` with an additional caller-built SQL predicate
+    /// (UI filter bar: compiled Mongo-style field equals).
+    pub async fn list_parents_filtered(
+        &self,
+        limit: usize,
+        offset: usize,
+        filter_sql: Option<&str>,
+    ) -> Result<Vec<Record>> {
+        let t = self.conn.open_table(&self.table).execute().await?;
+        let pred = match filter_sql {
+            Some(f) => format!("chunk_level = 0 AND {f}"),
+            None => "chunk_level = 0".to_string(),
+        };
+        let results = t
+            .query()
+            .only_if(pred)
+            .limit(limit)
+            .offset(offset)
+            .execute()
+            .await?;
+        records_from_stream(results, &self.scalar_fields).await
+    }
+
     /// Sibling chunks sharing a parent, sorted by chunk_index, excluding the
     /// hit itself — used by the `auto` sentence-window expansion.
     pub async fn get_sibling_chunks(
