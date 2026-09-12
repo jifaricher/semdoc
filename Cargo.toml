@@ -29,6 +29,8 @@ anyhow = "1"
 thiserror = "2"
 urlencoding = "2"
 md-5 = "0.10"
+hmac = "0.12"
+sha2 = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

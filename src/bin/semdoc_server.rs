@@ -139,6 +139,7 @@ async fn main() -> Result<()> {
     let mcp = McpServer::new(&args.db, args.rerank, args.config.as_deref()).await?;
     let deploy = semdoc::config::DeploymentConfig::load(args.config.as_deref())?;
     deploy.apply_chunk_env();
+    semdoc::mcp::register_webhooks(deploy.server.clone());
     let token = deploy
         .server_token()
         .or_else(|| std::env::var("SEMDOC_TOKEN").ok());
@@ -225,6 +226,11 @@ async fn add_doc(
     semdoc_bin_helpers::write_doc(&state.mcp.engine.store, &state.mcp.engine.embedder, doc)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    semdoc::mcp::fire_event(
+        "add",
+        &blake3::hash(body.text.as_bytes()).to_hex(),
+        json!({ "via": "rest" }),
+    );
     // Mirror into the graph KB (entity extraction is slow; degrade loudly,
     // never fail the write — LanceDB is the source of truth).
     let graph_text = body.text.clone();
