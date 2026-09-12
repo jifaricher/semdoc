@@ -133,12 +133,42 @@ pub struct ServerConfig {
     pub token_env: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[derive(Debug, Clone, Deserialize, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
     /// Accept invalid certs (self-signed endpoints). Default false.
+    /// Prefer `ca_bundle` when possible — this flag disables validation
+    /// entirely, exposing Bearer tokens to interception.
     #[serde(default)]
     pub insecure: bool,
+    /// Path to a PEM bundle with the company CA cert(s) to trust in
+    /// addition to the system store (e.g. `/etc/semdoc/company-ca.pem`).
+    /// Clients keep validating everything else. Empty = system store only.
+    #[serde(default)]
+    pub ca_bundle: Option<String>,
+}
+
+impl TlsConfig {
+    /// Apply the config to the process-wide TLS environment so that every
+    /// HTTP client (embedder / reranker / graph plugin) picks it up. This
+    /// bridges the config-file setting to the shared `semdoc::tls` helper —
+    /// env vars set explicitly by the operator still win (they are applied
+    /// later by `apply_env_overrides` and re-checked here).
+    pub fn apply_env(&self) {
+        if self.insecure {
+            std::env::set_var(semdoc_tls::ENV_INSECURE, "1");
+        }
+        if let Some(p) = &self.ca_bundle {
+            std::env::set_var(semdoc_tls::ENV_CA_BUNDLE, p);
+        }
+    }
+}
+
+/// Minimal facade over the shared TLS helper so config code doesn't depend
+/// on the whole `tls` module (env var names live there).
+mod semdoc_tls {
+    pub const ENV_INSECURE: &str = "SEMDOC_TLS_INSECURE";
+    pub const ENV_CA_BUNDLE: &str = "SEMDOC_CA_BUNDLE";
 }
 
 impl DeploymentConfig {
@@ -286,6 +316,16 @@ impl DeploymentConfig {
         if let Ok(v) = std::env::var("SEMDOC_TLS_INSECURE") {
             self.tls.insecure = v == "1" || v.eq_ignore_ascii_case("true");
         }
+        if let Ok(v) = std::env::var("SEMDOC_CA_BUNDLE") {
+            if !v.is_empty() {
+                self.tls.ca_bundle = Some(v);
+            }
+        }
+        // Re-export the resolved TLS settings so every HTTP client (they read
+        // the env via semdoc::tls) sees the Config.toml values too — the
+        // config file is the default source, env vars can still override
+        // because they were merged into self.tls above.
+        self.tls.apply_env();
         Ok(())
     }
 

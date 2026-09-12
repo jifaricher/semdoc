@@ -6,6 +6,13 @@
 - 禁止 `cargo build --release` 和 `cargo build --bins`（会让磁盘 iowait 打满）
 - 测试用 `cargo test --lib`；lint 用 `cargo clippy --all-targets`
 
+## TLS（内网自签证书）
+
+- 所有 HTTP 客户端统一走 `semdoc::tls`（src/tls.rs）；**默认从 Config.toml [tls] 读**
+  （`TlsConfig::apply_env` 在配置加载时导出 env），env `SEMDOC_CA_BUNDLE` /
+  `SEMDOC_TLS_INSECURE` 优先。
+- 优先 `ca_bundle`（reqwest `tls_certs_merge`，公司 CA 加信任链）而非 `insecure`。
+
 ## 与 lightrag 交互（backend = "lightrag-server"）
 
 - 启动/停止/探活一律用本项目脚本：`./scripts/start-lightrag-server.sh [--bg|--stop|--health]`。

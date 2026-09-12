@@ -18,5 +18,6 @@ pub mod query;
 pub mod reranker;
 pub mod schema;
 pub mod store;
+pub mod tls;
 
 pub use schema::SchemaConfig;

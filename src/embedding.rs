@@ -219,10 +219,7 @@ pub struct HttpEmbedder {
 impl HttpEmbedder {
     /// `url` is the base URL including `/v1`; POSTs to `{url}/embeddings`.
     pub fn new(url: &str, model: &str, api_key: Option<String>) -> Self {
-        let http = reqwest::blocking::Client::builder()
-            .danger_accept_invalid_certs(
-                std::env::var("SEMDOC_TLS_INSECURE").is_ok_and(|v| v == "1" || v == "true"),
-            )
+        let http = crate::tls::apply_blocking(reqwest::blocking::Client::builder())
             .connect_timeout(std::time::Duration::from_secs(10))
             .timeout(std::time::Duration::from_secs(60))
             .pool_idle_timeout(std::time::Duration::from_secs(90))

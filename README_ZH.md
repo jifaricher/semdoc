@@ -211,6 +211,33 @@ cargo test --lib               # 单元+集成测试
 cargo clippy --all-targets     # lint
 ```
 
+## TLS / 内部证书（[tls]）
+
+所有出站 HTTPS 客户端（embedder / reranker / graph 插件）共用一套 TLS 策略，
+**默认从 Config.toml 读取**（与其它配置项一致），也可用环境变量覆盖：
+
+```toml
+[tls]
+# 方案 A（推荐）: 公司内部 CA 加入信任链,其余证书照常验证
+ca_bundle = "/etc/semdoc/company-ca.pem"
+
+# 方案 B（不推荐）: 完全禁用证书验证 —— Bearer 密钥可被中间人截获
+insecure = false
+```
+
+等价环境变量（优先级高于文件）：`SEMDOC_CA_BUNDLE`、`SEMDOC_TLS_INSECURE`。
+
+真实测试验证过的行为：
+
+| 配置 | 访问自签 CA 签发的 https 服务 |
+|---|---|
+| 默认（无 [tls]） | ❌ 握手拒绝（证书验证失败） |
+| `ca_bundle = <签发该证书的 CA>` | ✅ 精确信任，握手成功 |
+| `insecure = true` | ✅ 通过（但无任何验证） |
+
+CA 文件为 PEM 格式，可包含多张证书（`from_pem_bundle`）。文件不可读/解析失败时
+启动打警告并回退为系统证书库（不中断）。
+
 ## 安全基线
 
 - MCP/HTTP 的 `limit` 上限 200；`raw_text` 响应截断 2000 字符（`get_document` 除外）
