@@ -5651,6 +5651,7 @@ dependencies = [
  "clap",
  "futures",
  "lancedb",
+ "md-5",
  "ndarray 0.17.2",
  "ort",
  "pyo3",

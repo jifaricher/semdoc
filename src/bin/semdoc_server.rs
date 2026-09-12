@@ -191,6 +191,13 @@ async fn add_doc(
     semdoc_bin_helpers::write_doc(&state.engine.store, &state.engine.embedder, doc)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    // Mirror into the graph KB (entity extraction is slow; degrade loudly,
+    // never fail the write — LanceDB is the source of truth).
+    let graph_text = body.text.clone();
+    let graph_id = blake3::hash(body.text.as_bytes()).to_hex().to_string();
+    if let Err(e) = state.graph.insert(vec![(graph_text, graph_id)]).await {
+        eprintln!("[graph] insert degraded: {e:#}");
+    }
     Ok(Json(json!({"ok": true})))
 }
 
@@ -208,6 +215,9 @@ async fn delete_doc(
         .delete_by_id(&body.id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    if let Err(e) = state.graph.delete(&body.id).await {
+        eprintln!("[graph] delete degraded: {e:#}");
+    }
     Ok(Json(json!({"ok": true})))
 }
 
