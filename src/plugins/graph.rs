@@ -64,6 +64,37 @@ pub trait GraphPlugin: Send + Sync {
     async fn health(&self) -> Result<()>;
     async fn insert(&self, docs: Vec<(String, String)>) -> Result<()>;
     async fn delete(&self, doc_id: &str) -> Result<()>;
+
+    /// Delete with retry on lightrag's pipeline-busy window. lightrag
+    /// refuses destructive ops while an ingestion batch / scan / other
+    /// delete is running (200 + status=busy); the delete itself is
+    /// idempotent, so retrying after a wait is safe. 3 attempts with
+    /// 10s/20s backoff covers short pipelines; longer ones surface the
+    /// error and the caller decides (LanceDB side is already gone, the
+    /// graph residue is reported).
+    async fn delete_with_retry(&self, doc_id: &str, attempts: usize) -> Result<()> {
+        for attempt in 0..attempts.max(1) {
+            match self.delete(doc_id).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let busy = format!("{e:#}").contains("busy");
+                    if attempt + 1 < attempts && busy {
+                        let wait = std::time::Duration::from_secs(10 * (attempt as u64 + 1));
+                        eprintln!(
+                            "[graph] delete busy (attempt {}/{}), retrying in {:?}: {doc_id}",
+                            attempt + 1,
+                            attempts,
+                            wait
+                        );
+                        tokio::time::sleep(wait).await;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Ok(())
+    }
     async fn query(
         &self,
         text: &str,
