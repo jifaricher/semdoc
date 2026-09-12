@@ -81,6 +81,49 @@ curl -X POST http://host:8092/mcp -H 'Authorization: Bearer <secret>' \
 
 **修改正文 vs 修改标签**：正文变了 → 用相同文本重新 `add_document`（同 id 幂等，自动重嵌入）；只改标签 → `update_document_metadata`。向量列不暴露改值接口，保证向量和文本永远一致。
 
+## 保留列（自动存在，不可在 [fields] 声明）
+
+每张表的物理 schema 由两部分组成：**保留列**（管线自身需要）+ **[fields] 用户字段**。保留列固定存在、名字不可占用：
+
+| 列 | 类型 | 作用 | 赋值/计算方式 |
+|---|---|---|---|
+| `id` | Utf8 NOT NULL | 行主键（BTree 索引），merge_insert upsert 的合并键 | parent 行 = `blake3(全文)`；叶子 chunk 行 = `blake3(parent_id:chunk_index:chunk文本)`（确定性哈希，同内容重写产生同 id → 幂等 upsert） |
+| `raw_text` | Utf8 NOT NULL | 该行文本内容 | parent = 原始全文；叶子 = 该 chunk 的切片文本（默认 512 字符、50 重叠，可用 `SEMDOC_CHUNK_SIZE/OVERLAP` 调整） |
+| `chunk_level` | UInt8 NOT NULL | 行层级 | 0 = 父文档行；1 = 叶子 chunk 行（ANN 检索只在这一层） |
+| `chunk_index` | UInt32 NOT NULL | chunk 在父文档内的 0 基序号 | 切块器按顺序分配；`expand_to=auto` 的句窗口（±1 相邻合并）依赖它 |
+| `parent_doc_id` | Utf8 NULL | 叶子行指向的父文档 id | 叶子行 = 其 parent 的 id；父行 = NULL。删除/展开/级联更新都靠它 |
+
+## source_path / source_type：现在是普通字段
+
+旧版本（含 semrag）里它们是保留列；**现在降级为普通 `[fields]` 字段**——需要来源追溯的库自己声明，不需要的库不存在这两列：
+
+```toml
+[fields]
+# 来源路径：建议 index = true 便于过滤；replace_key = true 启用"同来源替换"
+source_path = { type = "string", index = true, replace_key = true }
+# 来源形态：file / text / directory / glob ...
+source_type = { type = "string", replace_key = true }
+```
+
+三个写入入口（CLI `add`、server `POST /documents`、MCP `add_document`）都会在 schema 声明了这两个字段时自动填值（`source_path` 取 `--source`/请求参数，`source_type` 分别为 `file`/`text`/请求参数），MCP/REST 的 metadata 里也可显式覆盖。
+
+## replace_key：按业务身份替换（replace-on-add）
+
+id 是内容哈希——改了正文再 add 会得到新 id，旧版本不会被触碰。要"修改文档"语义，在 schema 里给业务标识字段加 `replace_key = true`（可多个，**AND 语义**：所有键都匹配才替换）：
+
+- `add` 写入前，用本次写入的 replace_key 值组合成等值查询，命中同一批旧 parent 文档（及其全部叶子 chunk）→ 先删除（LanceDB 级联 + lightrag 镜像同步删除），再写新版本
+- 所有 replace_key 字段都必须是 `string` 类型（validate 强制）
+- 未传齐 replace_key 字段的写入不做替换（追加语义）
+- MCP `add_document` 响应会注明 `（已按 replace_key 替换旧版本 <旧id>）`
+
+## schema 与数据库的兼容性校验
+
+`semdoc init` 时会把物理 `[fields]`（名 -> 类型）快照写到 `<db>/physical_fields.toml`。之后每次打开库（CLI / server / MCP），传入的 schema 都会和快照比对：
+
+- 列集与类型**完全一致** → 正常打开（`index`/`required`/`replace_key` 等元数据可以随 schema 演进）
+- schema 删了库里的列、加了库里没有的列、或改了列类型 → **启动即报错**，逐项列出差异（提示 re-init 或 semdoc-migrate）
+- 旧库没有快照文件 → 打印一次警告并跳过检查（向后兼容），重新 init 后启用
+
 ## 后端选型
 
 | 能力 | 后端 |
