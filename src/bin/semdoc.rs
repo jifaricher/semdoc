@@ -102,9 +102,12 @@ impl Remote {
 enum Cmd {
     /// Initialize a database from a schema config
     Init {
-        /// Path to schema.toml
+        /// Path to schema.toml (or omit and use --template)
         #[arg(short, long)]
-        schema: String,
+        schema: Option<String>,
+        /// Built-in template: generic | code-search | paper-library | kernel-docs
+        #[arg(long)]
+        template: Option<String>,
         /// Database directory
         #[arg(short, long)]
         db: String,
@@ -243,7 +246,7 @@ async fn main() -> Result<()> {
     deploy.apply_chunk_env();
     DEPLOY.set(deploy).ok();
     match args.cmd {
-        Cmd::Init { schema, db } => init(schema, db).await,
+        Cmd::Init { schema, db, template } => init(schema, template, db).await,
         Cmd::Add { db, server, token, file, text, source, metas } => add(db, server, token, file, text, source, metas).await,
         Cmd::Query { db, server, token, text, mode, limit, filter, filter_sql } => query(db, server, token, text, mode, limit, filter, filter_sql).await,
         Cmd::Delete { db, server, token, id, force } => delete(db, server, token, id, force).await,
@@ -253,7 +256,21 @@ async fn main() -> Result<()> {
     }
 }
 
-async fn init(schema_path: String, db: String) -> Result<()> {
+
+async fn init(schema_path: Option<String>, template: Option<String>, db: String) -> Result<()> {
+    let schema_path = match (schema_path, template) {
+        (Some(p), None) => p,
+        (None, Some(t)) => {
+            let content = semdoc::schema::template_schema_content(&t)?;
+            let path = format!("{db}.template.schema.toml");
+            std::fs::create_dir_all(&db)?;
+            std::fs::write(&path, content)?;
+            println!("template `{t}` written to {path}");
+            path
+        }
+        (Some(_), Some(_)) => anyhow::bail!("--schema and --template are mutually exclusive"),
+        (None, None) => anyhow::bail!("--schema <path> or --template <name> is required"),
+    };
     let config = SchemaConfig::load(std::path::Path::new(&schema_path))?;
     // Probe the actual embedder dim once. If the config has explicit vector
     // fields, verify each auto_embed field's dim matches the embedder — a

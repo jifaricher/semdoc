@@ -414,6 +414,101 @@ impl SchemaConfig {
     }
 }
 
+/// Built-in starter schemas. Each template = one schema.toml; after init
+/// the caller adds documents through any interface. `generic` is default.
+pub fn template_schema_content(name: &str) -> anyhow::Result<&'static str> {
+    Ok(match name {
+        "generic" => r#"# semdoc template: generic document library
+[table]
+name = "documents"
+
+[vector]
+fields = [
+  { name = "dense_vec", dim = 1024, source = "raw_text", metric = "cosine", index = "none" },
+]
+
+[fields]
+category = { type = "string", index = true }
+source_path = { type = "string", index = true, replace_key = true }
+tags = { type = "list<string>" }
+
+[plugins.rerank]
+backend = "tei"
+endpoint = "http://127.0.0.1:8000"
+"#,
+        "code-search" => r#"# semdoc template: code search over a source tree
+[table]
+name = "documents"
+
+[vector]
+fields = [
+  { name = "dense_vec", dim = 1024, source = "raw_text", metric = "cosine", index = "none" },
+]
+
+[fields]
+language  = { type = "string", index = true }   # c / rust / python / ...
+repo      = { type = "string", index = true }   # repo name
+path      = { type = "string", index = true }   # file path, unique per doc
+symbol    = { type = "string", index = true }   # function / struct name
+source_path = { type = "string", index = true, replace_key = true }
+
+[plugins.rerank]
+backend = "tei"
+endpoint = "http://127.0.0.1:8000"
+"#,
+        "paper-library" => r#"# semdoc template: research paper library
+[table]
+name = "documents"
+
+[vector]
+fields = [
+  { name = "dense_vec", dim = 1024, source = "raw_text", metric = "cosine", index = "none" },
+]
+
+[fields]
+title    = { type = "string", index = true }
+authors  = { type = "list<string>" }
+year     = { type = "int64", index = true }
+venue    = { type = "string", index = true }
+abstract_text = { type = "text" }               # searchable via FTS
+doi      = { type = "string", index = true, replace_key = true }
+
+[plugins.rerank]
+backend = "tei"
+endpoint = "http://127.0.0.1:8000"
+"#,
+        "kernel-docs" => r#"# semdoc template: kernel / systems documentation
+# (same shape as testdata/schema.toml — the semrag use case)
+[table]
+name = "documents"
+
+[vector]
+fields = [
+  { name = "dense_vec", dim = 1024, source = "raw_text", metric = "cosine", index = "none" },
+]
+
+[fields]
+domain    = { type = "string", index = true }   # sched / mm / net
+topic     = { type = "string", index = true }   # eevdf / slab / conntrack
+version   = { type = "string", index = true }   # e.g. olk-6.6
+keywords  = { type = "list<string>" }
+source_path = { type = "string", index = true, replace_key = true }
+source_type = { type = "string" }
+
+[plugins.graph]
+backend = "lightrag-server"
+endpoint = "http://127.0.0.1:9621"
+
+[plugins.rerank]
+backend = "tei"
+endpoint = "http://192.168.1.7:8000"
+"#,
+        other => anyhow::bail!(
+            "unknown template `{other}` — available: generic, code-search, paper-library, kernel-docs"
+        ),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -500,5 +595,38 @@ notes = { type = "text", index = true }
         )
         .unwrap();
         assert!(c.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod template_tests {
+    use super::*;
+
+    #[test]
+    fn all_templates_parse_and_validate() {
+        for name in ["generic", "code-search", "paper-library", "kernel-docs"] {
+            let content = template_schema_content(name).unwrap();
+            let cfg: SchemaConfig = toml::from_str(content)
+                .unwrap_or_else(|e| panic!("template {name}: parse: {e}"));
+            cfg.validate().unwrap_or_else(|e| panic!("template {name}: validate: {e}"));
+        }
+    }
+
+    #[test]
+    fn unknown_template_lists_available() {
+        let err = template_schema_content("nope").unwrap_err();
+        assert!(err.to_string().contains("generic, code-search"), "{err}");
+    }
+
+    #[test]
+    fn templates_are_distinct() {
+        let g = template_schema_content("generic").unwrap();
+        let c = template_schema_content("code-search").unwrap();
+        assert_ne!(g, c);
+        // kernel-docs wires a graph plugin; others don't
+        let k: SchemaConfig = toml::from_str(template_schema_content("kernel-docs").unwrap()).unwrap();
+        assert!(k.plugins.graph.is_some());
+        let g_cfg: SchemaConfig = toml::from_str(g).unwrap();
+        assert!(g_cfg.plugins.graph.is_none());
     }
 }
