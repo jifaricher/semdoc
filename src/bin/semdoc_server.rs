@@ -186,6 +186,9 @@ async fn main() -> Result<()> {
         .route("/mcp", post(mcp_post).delete(mcp_delete))
         .route("/stats", get(stats))
         .route("/health", get(health))
+        .route("/ui", get(ui_index))
+        .route("/ui/search", get(ui_search))
+        .route("/ui/doc/:id", get(ui_doc))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
@@ -809,6 +812,279 @@ mod semdoc_bin_helpers {
         store.write_batch(batch).await?;
         Ok(())
     }
+}
+
+
+// ── Web UI ─────────────────────────────────────────────────────────
+//
+// Read-only HTML pages served from the same axum router. No external
+// assets, no template engine — format! + html_escape. Filter bar is
+// generated from the database schema ([fields]); the search box calls
+// /query/semantic + /query/text server-side and renders both result
+// sets side by side. UI is GET-only (no mutation surface).
+
+use axum::extract::Query as AxumQuery;
+
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+fn ui_page(title: &str, body: &str) -> String {
+    format!(
+        "<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>{title} — semdoc</title>\
+<style>\
+body{{font-family:system-ui,sans-serif;margin:0;background:#f7f7f5;color:#222}}\
+header{{background:#1a1a2e;color:#fff;padding:14px 24px;display:flex;gap:24px;align-items:center}}\
+header a{{color:#9ad;font-size:15px;text-decoration:none}}\
+header .brand{{font-weight:700;font-size:17px;color:#fff}}\
+main{{padding:24px;max-width:1200px;margin:0 auto}}\
+table{{border-collapse:collapse;width:100%%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.08)}}\
+th{{background:#eeeef0;text-align:left;padding:8px 10px;font-size:13px}}\
+td{{padding:8px 10px;border-top:1px solid #e4e4e6;font-size:14px;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}\
+tr:hover td{{background:#f0f4ff}}\
+a{{color:#28c}}\
+form.filter{{background:#fff;padding:14px;box-shadow:0 1px 3px rgba(0,0,0,.08);margin-bottom:18px;display:flex;flex-wrap:wrap;gap:10px;align-items:end}}\
+form.filter label{{font-size:12px;color:#666;display:block}}\
+form.filter input{{padding:6px 8px;border:1px solid #ccc;border-radius:4px;width:150px}}\
+form.filter button,.searchbtn{{padding:7px 16px;background:#28c;color:#fff;border:0;border-radius:4px;cursor:pointer}}\
+input.q{{width:320px}}\
+pre{{background:#fff;padding:18px;box-shadow:0 1px 3px rgba(0,0,0,.08);white-space:pre-wrap;word-break:break-word;font-size:14px;line-height:1.6}}\
+.meta{{background:#fff;padding:12px 18px;box-shadow:0 1px 3px rgba(0,0,0,.08);margin-bottom:14px;font-size:13px}}\
+.meta b{{color:#555}}\
+.badge{{display:inline-block;background:#eef;padding:2px 8px;border-radius:10px;margin-left:6px;font-size:12px}}\
+h2{{font-size:16px;margin:24px 0 10px}}\
+</style></head><body>\
+<header><span class=\"brand\">semdoc</span><a href=\"/ui\">Documents</a><a href=\"/ui/search\">Search</a></header>\
+<main>{body}</main></body></html>"
+    )
+}
+
+/// GET /ui — paged parent documents with a schema-driven filter bar.
+async fn ui_index(
+    State(state): State<Arc<AppState>>,
+    AxumQuery(params): AxumQuery<std::collections::HashMap<String, String>>,
+) -> Result<axum::response::Html<String>, (StatusCode, String)> {
+    let page: usize = params.get("page").and_then(|p| p.parse().ok()).unwrap_or(1).max(1);
+    let size = 50usize;
+    let offset = (page - 1) * size;
+
+    // Mongo-style filter compiled server-side from the query params that
+    // match declared [fields] — same DSL the API uses.
+    let mut filter_obj = serde_json::Map::new();
+    for (k, v) in &params {
+        if state.mcp.engine.config.fields.contains_key(k) && !v.is_empty() {
+            filter_obj.insert(k.clone(), Value::String(v.clone()));
+        }
+    }
+    let filter_sql = if filter_obj.is_empty() {
+        None
+    } else {
+        let pred = semdoc::query::Pred::from_json(&Value::Object(filter_obj)).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        Some(pred.compile(&state.mcp.engine.config).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?)
+    };
+
+    // List with the filter, count all matching for pagination.
+    let docs = state
+        .mcp
+        .engine
+        .store
+        .list_parents_filtered(size, offset, filter_sql.as_deref())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    // Filter bar inputs: every string-ish field gets one input.
+    let cur = |k: &str| html_escape(params.get(k).map(|s| s.as_str()).unwrap_or(""));
+    let mut bar = String::from("<form class=\"filter\" method=\"get\" action=\"/ui\">");
+    for (name, fc) in state.mcp.engine.config.fields.iter() {
+        if fc.r#type == "string" {
+            bar.push_str(&format!(
+                "<span><label>{}</label><br><input name=\"{}\" value=\"{}\"></span>",
+                html_escape(name),
+                html_escape(name),
+                cur(name)
+            ));
+        }
+    }
+    bar.push_str("<span><br><button type=\"submit\">Filter</button></span></form>");
+
+    // Rows
+    let mut rows = String::new();
+    for d in &docs {
+        let short_id = if d.id.len() >= 12 { &d.id[..12] } else { &d.id };
+        let mut cells = format!(
+            "<td><a href=\"/ui/doc/{}\" title=\"{}\">{}</a></td><td>{}</td>",
+            html_escape(&d.id),
+            html_escape(&d.id),
+            html_escape(short_id),
+            html_escape(&d.raw_text.chars().take(90).collect::<String>())
+        );
+        for (name, _) in state.mcp.engine.config.fields.iter() {
+            let v = d
+                .extra
+                .get(name)
+                .map(|v| match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                })
+                .unwrap_or_default();
+            cells.push_str(&format!("<td>{}</td>", html_escape(&v)));
+        }
+        rows.push_str(&format!("<tr>{cells}</tr>\n"));
+    }
+    let mut header = String::from("<tr><th>id</th><th>text</th>");
+    for name in state.mcp.engine.config.fields.keys() {
+        header.push_str(&format!("<th>{}</th>", html_escape(name)));
+    }
+    header.push_str("</tr>");
+
+    // Pagination preserving filters
+    let mut qs: Vec<String> = params
+        .iter()
+        .filter(|(k, _)| state.mcp.engine.config.fields.contains_key(*k) && !k.is_empty())
+        .map(|(k, v)| format!("{k}={}", url_encode(v)))
+        .collect();
+    let page_nav = |p: usize, label: &str| -> String {
+        let mut q = qs.clone();
+        q.push(format!("page={p}"));
+        format!("<a href=\"/ui?{}\">{label}</a>", q.join("&amp;"))
+    };
+    let nav = match page {
+        1 => format!("{} &nbsp; {}", page_nav(page + 1, "next →"), offset + docs.len()),
+        _ if docs.len() == size => format!(
+            "{} &nbsp; page {page} &nbsp; {}",
+            page_nav(page - 1, "← prev"),
+            page_nav(page + 1, "next →")
+        ),
+        _ => format!("{} &nbsp; page {page} (end)", page_nav(page - 1, "← prev")),
+    };
+    qs.clear(); // silence unused warning path when fields empty
+
+    let body = format!(
+        "<h2>Documents <span class=\"badge\">{} shown</span></h2>{bar}\
+<table>{header}{rows}</table><p style=\"font-size:13px;color:#666\">{nav}</p>",
+        docs.len()
+    );
+    Ok(axum::response::Html(ui_page("Documents", &body)))
+}
+
+/// GET /ui/doc/:id — full raw_text + metadata table.
+async fn ui_doc(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<axum::response::Html<String>, (StatusCode, String)> {
+    let rec = state
+        .mcp
+        .engine
+        .store
+        .get_by_id(&id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let Some(rec) = rec else {
+        return Err((StatusCode::NOT_FOUND, format!("document {id} not found")));
+    };
+    let mut meta = format!(
+        "<div class=\"meta\"><b>id</b> {}<br><b>source_path</b> {} <b>source_type</b> {}",
+        html_escape(&rec.id),
+        html_escape(&rec.source_path),
+        html_escape(&rec.source_type)
+    );
+    if let Some(p) = &rec.parent_doc_id {
+        meta.push_str(&format!(
+            " &nbsp;<a href=\"/ui/doc/{p}\"><b>parent</b> {}…</a>",
+            html_escape(&p[..12.min(p.len())])
+        ));
+    }
+    for (k, v) in &rec.extra {
+        meta.push_str(&format!(
+            "<br><b>{}</b> {}",
+            html_escape(k),
+            html_escape(&match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+        ));
+    }
+    meta.push_str("</div>");
+    let text = if rec.chunk_level == 0 && rec.raw_text.chars().count() > 40_000 {
+        format!("{}\n\n… (truncated at 40k chars)", rec.raw_text.chars().take(40_000).collect::<String>())
+    } else {
+        rec.raw_text.clone()
+    };
+    let body = format!("{meta}<pre>{}</pre>", html_escape(&text));
+    Ok(axum::response::Html(ui_page("Document", &body)))
+}
+
+/// GET /ui/search?q=...&mode=semantic|fts — runs the query server-side
+/// and renders both result sets as cards.
+async fn ui_search(
+    State(state): State<Arc<AppState>>,
+    AxumQuery(params): AxumQuery<std::collections::HashMap<String, String>>,
+) -> Result<axum::response::Html<String>, (StatusCode, String)> {
+    let q = params.get("q").cloned().unwrap_or_default();
+    let mut body = "<form class=\"filter\" method=\"get\" action=\"/ui/search\">\
+<span><label>query</label><br><input class=\"q\" name=\"q\" value=\"Q\"></span>\
+<span><br><button class=\"searchbtn\" type=\"submit\">Search</button></span></form>"
+            .replace("Q", &html_escape(&q));
+    if q.trim().is_empty() {
+        body.push_str("<p style=\"color:#888\">Type a query — semantic and full-text results render side by side.</p>");
+        return Ok(axum::response::Html(ui_page("Search", &body)));
+    }
+
+    let render_hits = |title: &str, docs: &[semdoc::store::Record]| -> String {
+        let mut s = format!("<h2>{title}</h2>");
+        if docs.is_empty() {
+            s.push_str("<p style=\"color:#888\">no results</p>");
+            return s;
+        }
+        s.push_str("<table><tr><th>score-doc</th><th>text</th></tr>");
+        for d in docs {
+            let pid = d.parent_doc_id.clone().unwrap_or_else(|| d.id.clone());
+            s.push_str(&format!(
+                "<tr><td><a href=\"/ui/doc/{pid}\">{}</a></td><td>{}</td></tr>",
+                html_escape(&pid[..12.min(pid.len())]),
+                html_escape(&d.raw_text.chars().take(160).collect::<String>())
+            ));
+        }
+        s.push_str("</table>");
+        s
+    };
+
+    let semantic = state
+        .mcp
+        .engine
+        .query_semantic(&q, 10, None, ExpandTo::Chunk)
+        .await
+        .unwrap_or_default();
+    body.push_str(&render_hits("Semantic", &semantic));
+    let fts = state
+        .mcp
+        .engine
+        .query_fts(&q, 10, None)
+        .await
+        .unwrap_or_default();
+    body.push_str(&render_hits("Full-text", &fts));
+    Ok(axum::response::Html(ui_page("Search", &body)))
+}
+
+fn url_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => out.push(b as char),
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 // ── MCP streamable HTTP transport ─────────────────────────────────────
