@@ -61,6 +61,56 @@ curl -X POST http://host:8092/mcp -H 'Authorization: Bearer <secret>' \
 # 3) DELETE /mcp + Mcp-Session-Id 主动结束会话
 ```
 
+### 会话生命周期与自动重连（agent 必读）
+
+**默认超时时间**：24 小时空闲超时（idle TTL），定义在 `src/bin/semdoc_server.rs` 的
+`MCP_SESSION_TTL` 常量（清理扫描周期 `MCP_SWEEP_PERIOD` = 15 分钟）。语义要点：
+
+- **空闲超时，不是生命周期上限**：每次成功请求都会刷新 `last_seen`，持续使用的会话永不过期
+- 会话持久化在 `<db>/mcp_sessions.sqlite3`，**semdoc-server 重启不会踢掉已有会话**（重启后 TTL 重新计时）
+- `DELETE /mcp` 可主动终止；空闲 24h 后被后台扫描回收
+
+**agent 自动重连协议**：会话过期/无效时，服务端返回结构化错误（HTTP 400 + JSON-RPC error），
+agent 可机器识别并自动恢复，无需人工干预：
+
+```json
+{
+  "jsonrpc": "2.0", "id": 42,
+  "error": {
+    "code": -32001,
+    "message": "Session expired or unknown (idle TTL: 24h). Re-initialize to get a new Mcp-Session-Id.",
+    "data": {
+      "session_expired": true,
+      "reconnect": true,
+      "hint": "Retry initialize, then take Mcp-Session-Id from the response header and resend this request."
+    }
+  }
+}
+```
+
+判断依据：`error.code == -32001` 且 `error.data.reconnect == true`。
+（不带 Mcp-Session-Id 头的请求同样返回 -32001，但 `data.session_expired == false`，表示"从未初始化"而非"过期"。）
+
+**重连流程（伪代码）**：
+
+```python
+def mcp_call(method, params, session):
+    resp = post("/mcp", json={"jsonrpc": "2.0", "id": next_id(), "method": method, "params": params},
+                headers={"Authorization": f"Bearer {TOKEN}", **({"Mcp-Session-Id": session.id} if session else {})})
+    err = resp.get("error")
+    if err and err.get("code") == -32001 and err.get("data", {}).get("reconnect"):
+        # 会话过期：重新 initialize → 取新 session id → 重放原请求
+        init = post("/mcp", json={"jsonrpc": "2.0", "id": next_id(), "method": "initialize",
+                                  "params": {"protocolVersion": "2024-11-05"}},
+                    headers={"Authorization": f"Bearer {TOKEN}"})
+        session.id = init.headers["mcp-session-id"]
+        return mcp_call(method, params, session)   # 重试一次（原请求幂等性由调用方保证）
+    return resp
+```
+
+重连要点：重新 `initialize` 会得到**全新**的 `Mcp-Session-Id`（旧 id 不可恢复）；原请求需用新
+session 重发一次。工具调用均为单请求语义（无服务端多步事务），重放是安全的。
+
 ## MCP 工具清单（11 个）
 
 | 工具 | 说明 |

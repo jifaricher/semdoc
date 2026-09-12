@@ -1035,15 +1035,40 @@ async fn mcp_post(
 
     // Session enforcement: initialize mints a session; everything else
     // requires a valid Mcp-Session-Id (400, not 404 — endpoint exists).
+    // The error is a JSON-RPC error envelope with structured `data` so MCP
+    // agents can machine-detect expiry and auto-reconnect (see
+    // README_ZH.md §会话生命周期与自动重连).
     if method != "initialize" {
         let sid = headers
             .get("mcp-session-id")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         if state.mcp_sessions.get(sid).await.is_none() {
+            let is_missing = sid.is_empty();
+            let body = serde_json::to_string(&json!({
+                "jsonrpc": "2.0", "id": id,
+                "error": {
+                    "code": -32001,
+                    "message": if is_missing {
+                        "Invalid or missing Mcp-Session-Id. Call initialize first.".to_string()
+                    } else {
+                        format!(
+                            "Session expired or unknown (idle TTL: {}h). Re-initialize to get a new Mcp-Session-Id.",
+                            MCP_SESSION_TTL.as_secs() / 3600
+                        )
+                    },
+                    "data": {
+                        "session_expired": !is_missing,
+                        "reconnect": true,
+                        "hint": "Retry initialize, then take Mcp-Session-Id from the response header and resend this request."
+                    }
+                }
+            }))
+            .unwrap();
             return (
                 StatusCode::BAD_REQUEST,
-                "Invalid or missing Mcp-Session-Id. Call initialize first.",
+                [("content-type", "application/json")],
+                body,
             )
                 .into_response();
         }
