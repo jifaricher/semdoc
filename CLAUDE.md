@@ -8,10 +8,11 @@
 
 ## 与 lightrag 交互（backend = "lightrag-server"）
 
-- lightrag-server 用 `/workspace/semrag/scripts/start-lightrag-server.sh` 体系启动；
-  本机 venv 实际在 `/workspace/LightRAG/.venv`（脚本默认路径 /workspace/web/LightRAG 已失效，
-  需 `LIGHTRAG_VENV=/workspace/LightRAG PYTHONPATH=/workspace/LightRAG` 启动，
-  或用 `.venv/bin/python -m lightrag.api.lightrag_server`）。
+- 启动/停止/探活一律用本项目脚本：`./scripts/start-lightrag-server.sh [--bg|--stop|--health]`。
+  配置在项目根 `lightrag.toml`（与 Config.toml/schema.toml 解耦）；密钥走 `*_env`
+  间接引用（LIGHTRAG_PG_PASSWORD / LIGHTRAG_NEO4J_PASSWORD / LIGHTRAG_LLM_API_KEY …），
+  当前真实值可从 /workspace/semrag/.env 提取注入环境。
+  venv 探测顺序含 /workspace/LightRAG/.venv（shebang 断链，脚本用 python -m 启动绕开）。
 - 依赖服务：Postgres localhost:5455（semdoc_kernel workspace）、Neo4j localhost:7687。
 - 插件协议（src/plugins/graph.rs，lightrag-hku 1.5.6）：
   - insert: `POST /documents/text` `{"text","file_source":"<docid>.txt"}`（异步，不接受 ids）
