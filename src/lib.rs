@@ -12,6 +12,7 @@
 pub mod chunker;
 pub mod config;
 pub mod embedding;
+pub mod mcp;
 pub mod plugins;
 pub mod query;
 pub mod reranker;

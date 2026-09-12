@@ -1,13 +1,24 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! semdoc-server — HTTP REST + graph plugin endpoints.
+//! semdoc-server — HTTP REST + graph plugin + MCP streamable HTTP endpoints.
 //!
 //!   POST /documents            add doc (auto-embed)
+//!   POST /documents/delete     {id}
 //!   POST /query/semantic       {text, limit, filter?, expand_to?}
 //!   POST /query/text           {text, limit, filter?}
 //!   POST /query/reranked       {text, limit, filter?}
 //!   POST /query/graph          {text, limit} — via graph plugin, degrade to semantic
-//!   POST /documents/delete     {id}
+//!   POST /query/hybrid         {text, limit} — parallel atomic+graph, merged
+//!   GET  /documents/:id        fetch one row (full raw_text)
 //!   GET  /stats
+//!   GET  /health
+//!
+//! MCP streamable HTTP (2025-03-26 spec):
+//!   POST   /mcp   JSON-RPC over HTTP, optional SSE response; requires
+//!                 Authorization: Bearer <$SEMDOC_MCP_TOKEN> on every call.
+//!                 If the env var is unset, /mcp refuses all requests.
+//!   DELETE /mcp   terminates the Mcp-Session-Id session.
+//! Sessions are idle-TTL'd (24h) and persisted to SQLite so restarts
+//! don't kick connected clients.
 //!
 //! `filter` is the Mongo-style JSON DSL compiled against the schema.
 
@@ -15,17 +26,19 @@ use anyhow::Result;
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router,
 };
 use clap::Parser;
-use semdoc::plugins::graph::{build_graph_plugin, GraphMode, GraphPlugin};
-use semdoc::query::{record_json, Engine, ExpandTo};
-use semdoc::schema::SchemaConfig;
-use semdoc::store::{InputDoc, Store};
+use semdoc::mcp::Server as McpServer;
+use semdoc::plugins::graph::GraphMode;
+use semdoc::query::{record_json, ExpandTo};
+use semdoc::store::InputDoc;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use std::time::Instant;
 
 #[derive(Parser)]
 #[command(name = "semdoc-server", about = "HTTP server for semdoc")]
@@ -47,9 +60,13 @@ struct Args {
 }
 
 struct AppState {
-    engine: Engine,
-    graph: Box<dyn GraphPlugin>,
+    /// Shared MCP server — owns the Engine (store/embedder/reranker/config)
+    /// and the graph plugin. REST handlers reach them via `state.mcp.engine`.
+    mcp: McpServer,
     token: Option<String>,
+    mcp_sessions: Arc<McpSessionStore>,
+    /// Bearer token for /mcp. None = /mcp refuses everything (fail-closed).
+    expected_token: Option<Arc<String>>,
 }
 
 #[derive(Deserialize)]
@@ -109,7 +126,7 @@ fn filter_sql(state: &AppState, body: &QueryBody) -> Result<Option<String>, Stri
     match &body.filter {
         Some(f) if f.as_object().is_some_and(|o| !o.is_empty()) => {
             let pred = semdoc::query::Pred::from_json(f).map_err(|e| e.to_string())?;
-            pred.compile(&state.engine.config).map(Some).map_err(|e| e.to_string())
+            pred.compile(&state.mcp.engine.config).map(Some).map_err(|e| e.to_string())
         }
         _ => Ok(None),
     }
@@ -118,36 +135,42 @@ fn filter_sql(state: &AppState, body: &QueryBody) -> Result<Option<String>, Stri
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
-    let cfg_path = format!("{}/schema.toml", args.db);
-    let config = SchemaConfig::load(std::path::Path::new(&cfg_path))?;
-    let vec_fields = config.effective_vector_fields(1024);
-    let conn = lancedb::connect(&args.db).execute().await?;
-    let store = Store::new_existing(
-        conn,
-        config.table.name.clone(),
-        Store::arrow_schema(&config, &vec_fields),
-        vec_fields.clone(),
-        config.fields.clone(),
-    );
+    // One Server (engine + graph) backs both the REST handlers and /mcp.
+    let mcp = McpServer::new(&args.db, args.rerank, args.config.as_deref()).await?;
     let deploy = semdoc::config::DeploymentConfig::load(args.config.as_deref())?;
     deploy.apply_chunk_env();
-    let embedder = semdoc::embedding::Embedder::load(&deploy.embedding)?;
-    let reranker = if args.rerank {
-        Some(Arc::new(semdoc::reranker::Reranker::load(&deploy.rerank)?))
-    } else {
-        None
-    };
-    let graph = build_graph_plugin(&config.plugins.graph).await?;
     let token = deploy
         .server_token()
         .or_else(|| std::env::var("SEMDOC_TOKEN").ok());
     if args.auth && token.is_none() {
         anyhow::bail!("--auth requires server.token_env (config) or SEMDOC_TOKEN (env)");
     }
+    // MCP streamable HTTP: session store persisted next to the LanceDB dir
+    // (separate SQLite file so restarts rehydrate sessions), plus a
+    // background sweeper for idle-TTL expiry.
+    let mcp_sessions_path = format!("{}/mcp_sessions.sqlite3", args.db);
+    let mcp_sessions = Arc::new(McpSessionStore::open(&mcp_sessions_path));
+    {
+        let sessions_for_sweep = Arc::clone(&mcp_sessions);
+        tokio::spawn(async move {
+            sessions_for_sweep.ttl_sweep(MCP_SESSION_TTL, MCP_SWEEP_PERIOD).await;
+        });
+    }
+    let expected_token = std::env::var("SEMDOC_MCP_TOKEN").ok().map(Arc::new);
+    if expected_token.is_none() {
+        eprintln!(
+            "warning: SEMDOC_MCP_TOKEN not set — /mcp endpoint will refuse all \
+             requests. Set SEMDOC_MCP_TOKEN=<secret> to enable remote MCP."
+        );
+    } else {
+        eprintln!("/mcp endpoint enabled with bearer-token auth.");
+    }
+
     let state = Arc::new(AppState {
-        engine: Engine { store, embedder, reranker, config },
-        graph,
+        mcp,
         token,
+        mcp_sessions,
+        expected_token,
     });
 
     let app = Router::new()
@@ -159,6 +182,7 @@ async fn main() -> Result<()> {
         .route("/query/reranked", post(query_reranked))
         .route("/query/graph", post(query_graph))
         .route("/query/hybrid", post(query_hybrid))
+        .route("/mcp", post(mcp_post).delete(mcp_delete))
         .route("/stats", get(stats))
         .route("/health", get(health))
         .with_state(state);
@@ -188,14 +212,14 @@ async fn add_doc(
         extra: body.meta,
         vectors: Default::default(),
     };
-    semdoc_bin_helpers::write_doc(&state.engine.store, &state.engine.embedder, doc)
+    semdoc_bin_helpers::write_doc(&state.mcp.engine.store, &state.mcp.engine.embedder, doc)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     // Mirror into the graph KB (entity extraction is slow; degrade loudly,
     // never fail the write — LanceDB is the source of truth).
     let graph_text = body.text.clone();
     let graph_id = blake3::hash(body.text.as_bytes()).to_hex().to_string();
-    if let Err(e) = state.graph.insert(vec![(graph_text, graph_id)]).await {
+    if let Err(e) = state.mcp.graph.insert(vec![(graph_text, graph_id)]).await {
         eprintln!("[graph] insert degraded: {e:#}");
     }
     Ok(Json(json!({"ok": true})))
@@ -210,12 +234,12 @@ async fn delete_doc(
         return Err((StatusCode::UNAUTHORIZED, "unauthorized".into()));
     }
     state
-        .engine
+        .mcp.engine
         .store
         .delete_by_id(&body.id)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-    if let Err(e) = state.graph.delete(&body.id).await {
+    if let Err(e) = state.mcp.graph.delete(&body.id).await {
         eprintln!("[graph] delete degraded: {e:#}");
     }
     Ok(Json(json!({"ok": true})))
@@ -229,7 +253,7 @@ async fn get_doc(
     if !auth_ok(&state, &headers) {
         return Err((StatusCode::UNAUTHORIZED, "unauthorized".into()));
     }
-    match state.engine.store.get_by_id(&id).await {
+    match state.mcp.engine.store.get_by_id(&id).await {
         Ok(Some(rec)) => {
             let mut obj = serde_json::Map::new();
             obj.insert("id".into(), Value::String(rec.id.clone()));
@@ -264,7 +288,7 @@ async fn query_semantic(
     let sql = filter_sql(&state, &body).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let expand_to = body.expand_to.as_deref().map(ExpandTo::parse).unwrap_or(ExpandTo::Chunk);
     let docs = state
-        .engine
+        .mcp.engine
         .query_semantic(&body.text, body.limit.unwrap_or(10).min(semdoc::query::MAX_LIMIT), sql.as_deref(), expand_to)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
@@ -281,7 +305,7 @@ async fn query_text(
     }
     let sql = filter_sql(&state, &body).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let docs = state
-        .engine
+        .mcp.engine
         .query_fts(&body.text, body.limit.unwrap_or(10).min(semdoc::query::MAX_LIMIT), sql.as_deref())
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
@@ -298,7 +322,7 @@ async fn query_reranked(
     }
     let sql = filter_sql(&state, &body).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let docs = state
-        .engine
+        .mcp.engine
         .query_reranked(&body.text, body.limit.unwrap_or(10).min(semdoc::query::MAX_LIMIT), sql.as_deref())
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
@@ -320,12 +344,12 @@ async fn query_graph(
     let _ = filter_sql(&state, &body).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let mode = if want_answer { GraphMode::Hybrid } else { GraphMode::Data };
     let params = graph_params(&body);
-    let answer = match state.graph.query(&body.text, mode, limit, &params).await {
+    let answer = match state.mcp.graph.query(&body.text, mode, limit, &params).await {
         Ok(a) => a,
         Err(e) => {
             eprintln!("[graph] degraded to semantic: {e:#}");
             let docs = state
-                .engine
+                .mcp.engine
                 .query_semantic(&body.text, limit, None, ExpandTo::Chunk)
                 .await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
@@ -364,7 +388,7 @@ async fn query_graph(
         let mut documents: Vec<Value> = Vec::new();
         if !chunk_doc_ids.is_empty() {
             let parents = state
-                .engine
+                .mcp.engine
                 .store
                 .get_parents(&chunk_doc_ids)
                 .await
@@ -402,7 +426,7 @@ async fn query_graph(
                 .unwrap_or_default();
             if !contents.is_empty() {
                 let all_parents = state
-                    .engine
+                    .mcp.engine
                     .store
                     .all_parents()
                     .await
@@ -456,8 +480,8 @@ async fn query_hybrid(
     let want_answer = body.answer.unwrap_or(false);
     let mode = if want_answer { GraphMode::Hybrid } else { GraphMode::Data };
 
-    let atomic_fut = state.engine.query_reranked(&body.text, limit, sql.as_deref());
-    let graph_fut = state.graph.query(&body.text, mode, limit, &params);
+    let atomic_fut = state.mcp.engine.query_reranked(&body.text, limit, sql.as_deref());
+    let graph_fut = state.mcp.graph.query(&body.text, mode, limit, &params);
 
     let (atomic_res, graph_res) = tokio::join!(atomic_fut, graph_fut);
 
@@ -505,7 +529,7 @@ async fn query_hybrid(
                 })
                 .unwrap_or_default();
             if !chunk_doc_ids.is_empty() {
-                if let Ok(parents) = state.engine.store.get_parents(&chunk_doc_ids).await {
+                if let Ok(parents) = state.mcp.engine.store.get_parents(&chunk_doc_ids).await {
                     for id in &chunk_doc_ids {
                         if let Some(p) = parents.get(id) {
                             if seen.insert(p.id.clone()) {
@@ -517,7 +541,7 @@ async fn query_hybrid(
             }
             if merged.is_empty() {
                 // Content-matching fallback (lightrag HTTP builds without doc_id).
-                if let Ok(all) = state.engine.store.all_parents().await {
+                if let Ok(all) = state.mcp.engine.store.all_parents().await {
                     let contents: Vec<String> = data
                         .get("chunks")
                         .and_then(|c| c.as_array())
@@ -569,11 +593,11 @@ async fn query_hybrid(
 /// Liveness/readiness probe. No auth (probes don't carry tokens); no graph
 /// health call (must answer in milliseconds even when lightrag is down).
 async fn health(State(state): State<Arc<AppState>>) -> Resp<Value> {
-    let rows = state.engine.store.count().await.unwrap_or(0);
+    let rows = state.mcp.engine.store.count().await.unwrap_or(0);
     Ok(Json(json!({
         "ok": true,
         "rows": rows,
-        "graph": state.graph.name(),
+        "graph": state.mcp.graph.name(),
     })))
 }
 
@@ -585,7 +609,7 @@ async fn stats(
         return Err((StatusCode::UNAUTHORIZED, "unauthorized".into()));
     }
     let rows = state
-        .engine
+        .mcp.engine
         .store
         .count()
         .await
@@ -767,4 +791,351 @@ mod semdoc_bin_helpers {
         store.write_batch(batch).await?;
         Ok(())
     }
+}
+
+// ── MCP streamable HTTP transport ─────────────────────────────────────
+
+const MCP_SESSION_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const MCP_SWEEP_PERIOD: Duration = Duration::from_secs(15 * 60);
+
+use std::time::Duration;
+
+/// Per-session state for the MCP streamable HTTP transport. Created by
+/// `initialize`, looked up by `Mcp-Session-Id` on subsequent requests,
+/// removed by DELETE /mcp or idle-TTL expiry.
+#[derive(Clone)]
+struct McpSession {
+    initialized: bool,
+    protocol_version: String,
+    created_at: Instant,
+    last_seen: Instant,
+}
+
+/// In-memory session map mirrored to SQLite (`mcp_sessions` table) so a
+/// server restart rehydrates sessions instead of kicking every client.
+/// `last_seen` slides forward on every successful `get` — active sessions
+/// never expire; TTL is an idle timeout, not a lifetime cap.
+struct McpSessionStore {
+    sessions: tokio::sync::RwLock<std::collections::HashMap<String, McpSession>>,
+    db_path: String,
+}
+
+impl McpSessionStore {
+    fn open(db_path: &str) -> Self {
+        if let Ok(conn) = rusqlite::Connection::open(db_path) {
+            let _ = conn.execute(
+                "CREATE TABLE IF NOT EXISTS mcp_sessions (
+                    id               TEXT PRIMARY KEY,
+                    initialized      INTEGER NOT NULL,
+                    protocol_version TEXT NOT NULL,
+                    created_at       INTEGER NOT NULL,
+                    last_seen        INTEGER NOT NULL
+                )",
+                [],
+            );
+        }
+        let mut map = std::collections::HashMap::new();
+        if let Ok(conn) = rusqlite::Connection::open(db_path) {
+            if let Ok(mut stmt) = conn.prepare("SELECT id, initialized, protocol_version FROM mcp_sessions") {
+                if let Ok(rows) = stmt.query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                }) {
+                    let now = Instant::now();
+                    for r in rows.flatten() {
+                        map.insert(
+                            r.0,
+                            McpSession {
+                                initialized: r.1 != 0,
+                                protocol_version: r.2,
+                                created_at: now,
+                                last_seen: now,
+                            },
+                        );
+                    }
+                }
+            }
+        }
+        let n = map.len();
+        if n > 0 {
+            eprintln!("[mcp] rehydrated {n} session(s) from {db_path}");
+        }
+        Self {
+            sessions: tokio::sync::RwLock::new(map),
+            db_path: db_path.to_string(),
+        }
+    }
+
+    async fn get(&self, id: &str) -> Option<McpSession> {
+        let now = Instant::now();
+        let mut map = self.sessions.write().await;
+        if let Some(s) = map.get_mut(id) {
+            s.last_seen = now;
+            return Some(s.clone());
+        }
+        None
+    }
+
+    async fn insert(&self, id: String, session: McpSession) {
+        self.sessions.write().await.insert(id.clone(), session.clone());
+        let path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Ok(conn) = rusqlite::Connection::open(&path) {
+                let _ = conn.execute(
+                    "INSERT OR REPLACE INTO mcp_sessions (id, initialized, protocol_version, created_at, last_seen) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        id,
+                        session.initialized as i64,
+                        session.protocol_version,
+                        session.created_at.elapsed().as_secs() as i64,
+                        session.last_seen.elapsed().as_secs() as i64
+                    ],
+                );
+            }
+        });
+    }
+
+    async fn remove(&self, id: &str) -> bool {
+        let existed = self.sessions.write().await.remove(id).is_some();
+        if existed {
+            let path = self.db_path.clone();
+            let id = id.to_string();
+            tokio::task::spawn_blocking(move || {
+                if let Ok(conn) = rusqlite::Connection::open(&path) {
+                    let _ = conn.execute("DELETE FROM mcp_sessions WHERE id = ?1", [id]);
+                }
+            });
+        }
+        existed
+    }
+
+    async fn ttl_sweep(self: Arc<Self>, ttl: Duration, period: Duration) {
+        let mut interval = tokio::time::interval(period);
+        loop {
+            interval.tick().await;
+            let now = Instant::now();
+            let mut map = self.sessions.write().await;
+            let mut stale_ids: Vec<String> = Vec::new();
+            map.retain(|id, s| {
+                if now.duration_since(s.last_seen) < ttl {
+                    true
+                } else {
+                    stale_ids.push(id.clone());
+                    false
+                }
+            });
+            let evicted = stale_ids.len();
+            drop(map);
+            if evicted > 0 {
+                eprintln!("[mcp] TTL sweep evicted {evicted} stale session(s)");
+                let path = self.db_path.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Ok(conn) = rusqlite::Connection::open(&path) {
+                        for id in &stale_ids {
+                            let _ = conn.execute("DELETE FROM mcp_sessions WHERE id = ?1", [id]);
+                        }
+                    }
+                });
+            }
+        }
+    }
+}
+
+fn token_matches(received: &str, expected: &str) -> bool {
+    use std::hint::black_box;
+    if received.len() != expected.len() {
+        let _ = black_box(received.bytes().zip(expected.bytes()).map(|(a, b)| a ^ b));
+        return false;
+    }
+    let mut acc: u8 = 0;
+    for (a, b) in received.bytes().zip(expected.bytes()) {
+        acc |= a ^ b;
+    }
+    black_box(acc) == 0
+}
+
+fn extract_bearer(headers: &HeaderMap) -> Option<&str> {
+    let hv = headers.get(axum::http::header::AUTHORIZATION)?;
+    let s = hv.to_str().ok()?;
+    s.strip_prefix("Bearer ").map(|t| t.trim())
+}
+
+fn envelope(id: &Value, result: Value) -> Value {
+    if let Some(err) = result.get("error") {
+        json!({ "jsonrpc": "2.0", "id": id, "error": err })
+    } else {
+        json!({ "jsonrpc": "2.0", "id": id, "result": result })
+    }
+}
+
+fn uuid_str() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("{:016x}{:016x}", now.as_nanos(), n)
+}
+
+/// POST /mcp — streamable HTTP entry. JSON-RPC in; JSON or SSE out.
+async fn mcp_post(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let expected = match &state.expected_token {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "SEMDOC_MCP_TOKEN not set; /mcp disabled",
+            )
+                .into_response();
+        }
+    };
+    match extract_bearer(&headers) {
+        Some(received) if token_matches(received, expected) => {}
+        _ => return (StatusCode::UNAUTHORIZED, "Invalid or missing bearer token").into_response(),
+    }
+
+    let req: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => {
+            let body = serde_json::to_string(&json!({
+                "jsonrpc": "2.0", "id": null,
+                "error": { "code": -32700, "message": "Parse error", "data": e.to_string() }
+            }))
+            .unwrap();
+            return (
+                StatusCode::BAD_REQUEST,
+                [("content-type", "application/json")],
+                body,
+            )
+                .into_response();
+        }
+    };
+
+    let method = req.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    let params = req.get("params").cloned().unwrap_or(json!({}));
+    let id = req.get("id").cloned().unwrap_or(json!(null));
+
+    // Session enforcement: initialize mints a session; everything else
+    // requires a valid Mcp-Session-Id (400, not 404 — endpoint exists).
+    if method != "initialize" {
+        let sid = headers
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if state.mcp_sessions.get(sid).await.is_none() {
+            return (
+                StatusCode::BAD_REQUEST,
+                "Invalid or missing Mcp-Session-Id. Call initialize first.",
+            )
+                .into_response();
+        }
+    }
+
+    let result = match method {
+        "initialize" | "notifications/initialized" | "tools/list" | "tools/call" => {
+            semdoc::mcp::handle_request(&state.mcp, method, &params).await
+        }
+        other => json!({
+            "error": { "code": -32601, "message": format!("method not found: {other}") }
+        }),
+    };
+    let response_value = envelope(&id, result);
+
+    // initialize: mint a session, return it via Mcp-Session-Id header.
+    let session_header = if method == "initialize" {
+        let sid = uuid_str();
+        let now = Instant::now();
+        state
+            .mcp_sessions
+            .insert(
+                sid.clone(),
+                McpSession {
+                    initialized: true,
+                    protocol_version: params
+                        .get("protocolVersion")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("2024-11-05")
+                        .to_string(),
+                    created_at: now,
+                    last_seen: now,
+                },
+            )
+            .await;
+        Some(sid)
+    } else {
+        None
+    };
+
+    // Respond JSON when the client accepts it; otherwise wrap in one SSE
+    // `message` event (single response, no progress notifications).
+    let prefer_json = headers
+        .get(axum::http::header::ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| {
+            s.split(',').any(|t| {
+                let t = t.trim();
+                t.eq_ignore_ascii_case("application/json") || t.starts_with("application/json;")
+            })
+        })
+        .unwrap_or(true);
+
+    let body_str = serde_json::to_string(&response_value).unwrap();
+    let mut resp = if prefer_json {
+        (
+            StatusCode::OK,
+            [("content-type", "application/json")],
+            body_str,
+        )
+            .into_response()
+    } else {
+        let sse = format!("event: message\ndata: {body_str}\n\n");
+        (
+            StatusCode::OK,
+            [
+                ("content-type", "text/event-stream"),
+                ("cache-control", "no-cache"),
+            ],
+            sse,
+        )
+            .into_response()
+    };
+    if let Some(sid) = session_header {
+        if let Ok(hv) = axum::http::HeaderValue::from_str(&sid) {
+            resp.headers_mut().insert("mcp-session-id", hv);
+        }
+    }
+    resp
+}
+
+/// DELETE /mcp — terminate a session (spec: client sends DELETE with
+/// Mcp-Session-Id; server removes it and returns 200).
+async fn mcp_delete(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let expected = match &state.expected_token {
+        Some(t) => t,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                "SEMDOC_MCP_TOKEN not set; /mcp disabled",
+            )
+                .into_response();
+        }
+    };
+    match extract_bearer(&headers) {
+        Some(received) if token_matches(received, expected) => {}
+        _ => return (StatusCode::UNAUTHORIZED, "Invalid or missing bearer token").into_response(),
+    }
+    let sid = headers
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    state.mcp_sessions.remove(sid).await;
+    StatusCode::OK.into_response()
 }
