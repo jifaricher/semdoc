@@ -425,7 +425,7 @@ async fn add_document(server: &Server, args: &Value) -> Value {
                             continue;
                         }
                         if server.graph.name() != "none" {
-                            if let Err(e) = server.graph.delete(&p.id).await {
+                            if let Err(e) = server.graph.delete_with_retry(&p.id, 3).await {
                                 eprintln!(
                                     "[add] replace: graph delete degraded for {}: {e:#}",
                                     p.id
@@ -607,27 +607,44 @@ async fn add_document(server: &Server, args: &Value) -> Value {
 /// Delete by id with cascade: LanceDB (parent + leaves via parent_doc_id)
 /// then the graph KB. lightrag failure is reported in the response text so
 /// MCP clients know the graph side may still hold the doc.
+/// Shared delete pipeline used by MCP, REST and CLI: existence check on
+/// the parent/leaf id, LanceDB cascade delete, then lightrag mirror delete
+/// with busy-retry. Returns a human-readable status line; `Err` when
+/// nothing was deleted (unknown id or store failure).
+pub async fn delete_doc_checked(server: &Server, id: &str) -> Result<String> {
+    if id.is_empty() {
+        anyhow::bail!("id is required");
+    }
+    let Some(existing) = server.engine.store.get_by_id(id).await? else {
+        anyhow::bail!("document not found: {id}");
+    };
+    // Normalize: a leaf chunk id deletes its whole parent document.
+    let target = existing.parent_doc_id.clone().unwrap_or_else(|| existing.id.clone());
+    server.engine.store.delete_by_id(&target).await?;
+    let mut note = String::new();
+    if server.graph.name() != "none" {
+        match server.graph.delete_with_retry(&target, 3).await {
+            Ok(()) => {}
+            Err(e) => {
+                note = format!(
+                    "（注意：图谱侧删除失败（pipeline busy 等），lightrag 可能仍有残留；                     稍后重试同一命令即可补删: {e:#}）"
+                );
+                eprintln!("[graph] delete degraded: {e:#}");
+            }
+        }
+    }
+    Ok(format!("文档 {target} 已删除（chunks 级联清理）{note}"))
+}
+
 async fn delete_document(server: &Server, args: &Value) -> Value {
     let id = args.get("id").and_then(|v| v.as_str()).unwrap_or("");
     if id.is_empty() {
         return err("id is required");
     }
-    if let Err(e) = server.engine.store.delete_by_id(id).await {
-        return err(format!("delete failed: {e:#}"));
+    match delete_doc_checked(server, id).await {
+        Ok(msg) => json!({ "content": [{ "type": "text", "text": msg }] }),
+        Err(e) => err(format!("{e:#}")),
     }
-    let mut note = String::new();
-    if server.graph.name() != "none" {
-        match server.graph.delete(id).await {
-            Ok(()) => {}
-            Err(e) => {
-                note = format!("（注意：图谱侧删除失败，可能仍有残留: {e:#}）");
-                eprintln!("[graph] delete degraded: {e:#}");
-            }
-        }
-    }
-    json!({
-        "content": [{ "type": "text", "text": format!("文档 {id} 已删除{note}") }]
-    })
 }
 
 /// Type-check a JSON value against a schema field type (same set as

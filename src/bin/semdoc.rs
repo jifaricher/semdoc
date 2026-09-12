@@ -75,6 +75,17 @@ enum Cmd {
         #[arg(long)]
         filter_sql: Option<String>,
     },
+    /// Delete a document (cascades: parent + leaf chunks + lightrag mirror)
+    Delete {
+        #[arg(short, long)]
+        db: String,
+        /// Document id (parent or leaf chunk; a chunk id deletes its parent)
+        #[arg(short, long)]
+        id: String,
+        /// Skip the existence check (idempotent delete; no error when absent)
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
     /// Show database stats
     Stats {
         #[arg(short, long)]
@@ -117,6 +128,7 @@ async fn main() -> Result<()> {
         Cmd::Init { schema, db } => init(schema, db).await,
         Cmd::Add { db, file, text, source, metas } => add(db, file, text, source, metas).await,
         Cmd::Query { db, text, mode, limit, filter, filter_sql } => query(db, text, mode, limit, filter, filter_sql).await,
+        Cmd::Delete { db, id, force } => delete(db, id, force).await,
         Cmd::Stats { db } => stats(db).await,
     }
 }
@@ -298,13 +310,46 @@ pub async fn replace_old_versions(
         }
         store.delete_by_id(&p.id).await?;
         if graph.name() != "none" {
-            if let Err(e) = graph.delete(&p.id).await {
+            if let Err(e) = graph.delete_with_retry(&p.id, 3).await {
                 eprintln!("[replace] graph delete degraded for {}: {e:#}", p.id);
             }
         }
         replaced = Some(p.id);
     }
     Ok(replaced)
+}
+
+async fn delete(db: String, id: String, force: bool) -> Result<()> {
+    let (store, config) = open_store(&db).await?;
+    if id.is_empty() {
+        anyhow::bail!("--id is required");
+    }
+    // Existence check (skippable with --force): chunk id → parent id.
+    let target = if force {
+        id.clone()
+    } else {
+        match store.get_by_id(&id).await? {
+            None => anyhow::bail!("document not found: {id} (use --force to delete blindly)"),
+            Some(rec) => rec.parent_doc_id.clone().unwrap_or(rec.id),
+        }
+    };
+    store.delete_by_id(&target).await?;
+    // lightrag mirror: busy-retried (3 attempts, 10s/20s backoff). Failure
+    // leaves graph residue — reported, and the same command can be re-run
+    // later to clean up (delete is idempotent on both sides).
+    let graph = semdoc::plugins::graph::build_graph_plugin(&config.plugins.graph).await?;
+    if graph.name() != "none" {
+        match graph.delete_with_retry(&target, 3).await {
+            Ok(()) => println!("deleted {target} (lancedb + lightrag)"),
+            Err(e) => {
+                eprintln!("[graph] delete degraded after retries: {e:#}");
+                println!("deleted {target} (lancedb) — lightrag residue possible, re-run to retry");
+            }
+        }
+    } else {
+        println!("deleted {target} (lancedb; no graph backend configured)");
+    }
+    Ok(())
 }
 
 fn detect_language(path: &str, text: &str) -> String {

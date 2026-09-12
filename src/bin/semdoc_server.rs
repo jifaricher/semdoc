@@ -243,16 +243,18 @@ async fn delete_doc(
     if !auth_ok(&state, &headers) {
         return Err((StatusCode::UNAUTHORIZED, "unauthorized".into()));
     }
-    state
-        .mcp.engine
-        .store
-        .delete_by_id(&body.id)
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-    if let Err(e) = state.mcp.graph.delete(&body.id).await {
-        eprintln!("[graph] delete degraded: {e:#}");
+    match semdoc::mcp::delete_doc_checked(&state.mcp, &body.id).await {
+        Ok(_msg) => Ok(Json(json!({"ok": true}))),
+        Err(e) => {
+            let msg = format!("{e:#}");
+            let status = if msg.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            Err((status, msg))
+        }
     }
-    Ok(Json(json!({"ok": true})))
 }
 
 async fn get_doc(

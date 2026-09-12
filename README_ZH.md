@@ -17,11 +17,20 @@ semdoc 是 semrag 的第二版：一个通用向量知识库，**schema 是配�
 ### 1. CLI（`semdoc`）
 
 ```bash
-semdoc init  --schema schema.toml --db /path/to/db    # 初始化库
-semdoc add   --db /path/to/db --file doc.md [--meta K=V]
-semdoc query --db /path/to/db -t "查询" [--mode semantic|fts|rerank] [--filter '{"domain":"mm"}']
-semdoc stats --db /path/to/db
+semdoc init   --schema schema.toml --db /path/to/db    # 初始化库
+semdoc add    --db /path/to/db --file doc.md [--meta K=V]
+semdoc query  --db /path/to/db -t "查询" [--mode semantic|fts|rerank] [--filter '{"domain":"mm"}']
+semdoc delete --db /path/to/db --id <文档id> [--force]  # 删除（级联父/子/lightrag）
+semdoc stats  --db /path/to/db
 ```
+
+`delete` 说明：
+
+- `--id` 传父文档 id 或叶子 chunk id 均可（chunk id 自动归一化为父文档级联删除）
+- 默认做**存在性校验**：id 不存在时报 `document not found`（`--force` 跳过，幂等删除）
+- lightrag 侧删除带 **busy 重试**（3 次，10s/20s 退避）；lightrag 正在摄取大批量文档时
+  pipeline 会拒绝删除（`status=busy`），重试仍失败则提示残留——**隔一段时间重跑同一命令即可补删**
+  （两端删除都是幂等的）
 
 ### 2. HTTP REST（`semdoc-server`）
 
