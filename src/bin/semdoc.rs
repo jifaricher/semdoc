@@ -193,8 +193,9 @@ async fn add(db: String, file: Option<String>, text: Option<String>, source: Str
     };
     let extra = parse_metas(&metas, &config)?;
     let embedder = semdoc::embedding::load_from_env()?;
+    let doc_id = blake3::hash(text.as_bytes()).to_hex().to_string();
     let engine_inputs = InputDoc {
-        id: blake3::hash(text.as_bytes()).to_hex().to_string(),
+        id: doc_id.clone(),
         raw_text: text.clone(),
         source_path: source.clone(),
         source_type: "file".to_string(),
@@ -204,6 +205,15 @@ async fn add(db: String, file: Option<String>, text: Option<String>, source: Str
     };
     write_doc(&store, &embedder, engine_inputs).await?;
     store.optimize_indices().await?;
+    // Mirror into the graph KB when the schema configures one. Entity
+    // extraction is LLM-bound and slow; a failure here must not lose the
+    // LanceDB write — degrade with a warning instead.
+    let graph = semdoc::plugins::graph::build_graph_plugin(&config.plugins.graph).await?;
+    if graph.name() != "none" {
+        if let Err(e) = graph.insert(vec![(text, doc_id)]).await {
+            eprintln!("[graph] insert degraded: {e:#}");
+        }
+    }
     println!("added (id auto-hashed from content)");
     Ok(())
 }

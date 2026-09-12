@@ -172,10 +172,14 @@ impl GraphPlugin for LightragServer {
     async fn insert(&self, docs: Vec<(String, String)>) -> Result<()> {
         for (text, doc_id) in docs {
             let _permit = self.insert_semaphore.acquire().await?;
+            // lightrag >=1.5 requires `file_source` (it's the document's
+            // identity for dedup/409 on re-insert); `ids` is not accepted on
+            // this route. We pass the semdoc doc id as the file_source so
+            // deletes can target the same id.
             let url = format!("{}/documents/text", self.endpoint);
             let body = serde_json::json!({
                 "text": text,
-                "ids": [doc_id],
+                "file_source": format!("{doc_id}.txt"),
             });
             let resp = self
                 .auth(self.http.post(&url))
@@ -187,6 +191,9 @@ impl GraphPlugin for LightragServer {
             if !resp.status().is_success() {
                 let status = resp.status();
                 let t = resp.text().await.unwrap_or_default();
+                // Same file_source already tracked: lightrag refuses with 409
+                // until the old doc is deleted. Treat as an error — callers
+                // delete-then-insert to replace.
                 anyhow::bail!("lightrag insert {doc_id}: HTTP {status}: {t}");
             }
         }
@@ -194,16 +201,35 @@ impl GraphPlugin for LightragServer {
     }
 
     async fn delete(&self, doc_id: &str) -> Result<()> {
-        let url = format!("{}/documents", self.endpoint);
+        // lightrag derives a document's internal id as
+        // md5(file_source) = md5("<docid>.txt") when the doc was inserted
+        // with `file_source` (see lightrag pipeline.py known_source branch).
+        // Deleting by the raw semdoc id fails with "Document not found".
+        // Derive the same internal id here; fall back to the raw id for docs
+        // that were inserted by other means.
+        use md5::Digest;
+        let digest = format!("{:x}", md5::Md5::new_with_prefix(doc_id).chain_update(".txt").finalize());
+        let url = format!("{}/documents/delete_document", self.endpoint);
+        let ids = serde_json::json!([format!("doc-{digest}"), doc_id]);
         let resp = self
             .auth(self.http.delete(&url))
-            .query(&[("ids", doc_id)])
+            .json(&serde_json::json!({ "doc_ids": ids }))
             .timeout(std::time::Duration::from_secs(self.delete_timeout_secs))
             .send()
             .await
             .map_err(|e| anyhow::anyhow!("lightrag delete {doc_id}: {e}"))?;
         if !resp.status().is_success() {
             anyhow::bail!("lightrag delete {doc_id}: HTTP {}", resp.status());
+        }
+        // {"status":"busy"} is a 200 — the destructive slot was taken; the
+        // doc stays. Surface that to the caller rather than silently dropping.
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        if body["status"] == "busy" || body["status"] == "not_allowed" {
+            anyhow::bail!(
+                "lightrag delete {doc_id}: {} — {}",
+                body["status"].as_str().unwrap_or("busy"),
+                body["message"].as_str().unwrap_or("pipeline busy")
+            );
         }
         Ok(())
     }
