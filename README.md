@@ -1,74 +1,116 @@
-# semdoc — config-schema-driven vector knowledge base
+# semdoc — the schema is a config file, not a struct
 
-A general-purpose vector knowledge base where **the schema is a configuration
-file**, not a hardcoded struct. One schema file → one database. Run the tool
-with a different schema file → a different knowledge base. Storage, retrieval,
-embedding, reranking and graph reasoning are all pluggable.
+<p align="center">
+  <a href="README_ZH.md">中文文档</a> ·
+  <a href="#quickstart">Quickstart</a> ·
+  <a href="#mcp-use-with-claude-code">MCP / Claude Code</a> ·
+  <a href="#hybrid-search">Hybrid search</a> ·
+  <a href="#filtering">Filtering</a>
+</p>
 
-## Why
+**semdoc** is a vector knowledge base where the metadata schema is a
+configuration file, not a hardcoded struct. One `schema.toml` → one
+knowledge base; point it at a different schema and you have a different
+product. Storage (LanceDB), retrieval, embeddings, reranking and graph
+reasoning (LightRAG) are all pluggable.
 
-Traditional vector KBs hardcode their metadata columns (`doc_type`,
-`subsystem`, ...). semdoc lets the user declare them:
+Most RAG stores fix your metadata columns (`doc_type`, `subsystem`, ...).
+semdoc lets you declare them — and compiles filtering, MCP tool schemas,
+the Web UI and physical-schema compatibility checks from that single
+declaration.
 
 ```toml
-[table]
-name = "documents"
-
 [vector]
 fields = [
   { name = "dense_vec", dim = 1024, source = "raw_text", metric = "cosine", index = "none" },
 ]
 
-[fields]
-category = { type = "string", index = true }
-score    = { type = "float32", index = true }
-tags     = { type = "list<string>" }
+[fields]                                     # YOUR schema, not ours
+domain    = { type = "string", index = true }
+topic     = { type = "string", index = true }
+keywords  = { type = "list<string>" }
+source_path = { type = "string", index = true, replace_key = true }
 
-[plugins.graph]
+[plugins.graph]                              # optional multi-hop retrieval
 backend = "lightrag-server"
-endpoint = "http://127.0.0.1:9727"
-
-[plugins.rerank]
-backend = "tei"
-endpoint = "http://192.168.1.7:8000"
+endpoint = "http://127.0.0.1:9621"
 ```
 
-- **Vector fields** (`[vector]`) declare `name + dim + source + metric +
-  index`. `source` names the text field the embedding is derived from —
-  writes auto-embed; queries pick the column.
-- **Scalar fields** (`[fields]`) are user-defined, optionally indexed
-  (LanceDB BTree scalar index), and compile directly into ANN pre-filters —
-  filtering happens *before* the vector search, so no over-fetch is needed.
-- **Plugins** (`[plugins]`) wire in graph reasoning (lightrag) and rerank
-  backends. A plugin that fails health checks degrades gracefully; the KB
-  keeps working without it.
-
-## Backends
-
-| Capability | Backends |
-|---|---|
-| Embedding | `onnx` (bge-m3 in-process, feature `onnx`), `http` (OpenAI-compatible `/v1/embeddings`) |
-| Reranker | `onnx` (INT8 cross-encoder), `tei` (HTTP `/rerank`), `openai` (`/v1/rerank`) — transient-failure retry + ANN-order degradation |
-| Graph | `lightrag-server` (HTTP, zero Python), `lightrag-embedded` (PyO3, feature flag), `none` |
-
-## Interfaces
-
-- `semdoc` — CLI: `init` / `add` / `query` / `stats`
-- `semdoc-server` — HTTP REST (`/documents`, `/query/*`) + MCP streamable
-  HTTP (`/mcp`, bearer-token auth, persistent sessions)
-- `semdoc-mcp` — MCP stdio server
-
-MCP query results cap `raw_text` at 2000 chars (with a `truncated` marker)
-and default to `expand_to = "chunk"` (small-to-big retrieval: ANN over
-~512-char leaf chunks, expand on demand) so no tool result can blow the
-client's token budget.
-
-## Build
+## Quickstart (30 seconds)
 
 ```bash
-cargo build --release --bins
+cargo install --path .          # or: cargo build --release --bins
+
+semdoc init --template code-search --db ./mydb   # 4 built-in templates
+semdoc add   --db ./mydb --file src/main.rs --meta language=rust
+semdoc query --db ./mydb -t "where do we parse the config" --limit 5
 ```
 
-## Status
+Four ways to talk to the same data:
 
-Work in progress.
+| Interface | Use it for |
+|---|---|
+| `semdoc` CLI (`--db` local / `--server` remote) | ops, scripts, CI |
+| `semdoc-mcp` (stdio) | local MCP clients |
+| `semdoc-server /mcp` (streamable HTTP) | remote MCP clients, Claude Code |
+| `semdoc-server /ui` | built-in read-only Web UI (browse / filter / search) |
+
+## MCP: use with Claude Code
+
+Add a running server to Claude Code in one line:
+
+```bash
+claude mcp add --transport http semdoc http://localhost:8092/mcp \
+  --header "Authorization: Bearer $SEMDOC_MCP_TOKEN"
+```
+
+Or run the stdio server locally:
+
+```json
+{ "semdoc": { "command": "/path/to/semdoc-mcp", "args": ["--db", "/data/mydb"] } }
+```
+
+11 tools ship out of the box: `query_semantic`, `query_text`,
+`query_reranked`, `query_graph`, `query_hybrid`, `get_document`,
+`add_document`, `delete_document`, `update_document_metadata`,
+`list_documents`, `stats` — each described in Chinese and English-aware
+detail with schema-driven filter hints, so agents pick the right tool
+without hand-holding. Sessions survive server restarts (SQLite-backed),
+expire after 24h idle, and agents can auto-reconnect via a structured
+`-32001` error envelope.
+
+## Hybrid search
+
+`query_hybrid` runs reranked vector search and LightRAG graph retrieval
+in parallel and merges results by document id — graph entities give the
+multi-hop structure, chunks give the grounding text, one call gets both.
+Graph outages degrade to plain semantic search instead of failing.
+
+## Filtering
+
+Mongo-style JSON, validated against *your* schema and compiled to an
+ANN pre-filter (filtering happens before the vector scan — no
+over-fetch):
+
+```json
+{"subsystem": "mm", "priority": {"$gte": 3}, "keywords": {"$in": ["hugepage"]}}
+```
+
+Operators: `$eq $ne $in $nin $gt $gte $lt $lte $exists $and $or` —
+values are type-checked against the schema, so `{"priority": "high"}`
+is an error, not a silent no-match. Raw SQL exists as a local-only
+escape hatch and is never exposed over the network.
+
+## Docs
+
+- [中文文档 README_ZH.md](README_ZH.md) — full reference: config files,
+  MCP lifecycle, reserved columns, `replace_key` upserts, TLS/CA setup,
+  lightrag integration
+- `semdoc doctor` — one command checks config, embedder, reranker,
+  graph, schema compatibility and indexes, each failure with a fix hint
+- `docker compose up -d` — postgres (AGE+pgvector) and neo4j for the
+  graph backend
+
+## License
+
+MIT OR Apache-2.0
