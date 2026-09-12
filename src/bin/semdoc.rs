@@ -175,6 +175,29 @@ enum Cmd {
         #[arg(long, default_value_t = false)]
         force: bool,
     },
+    /// Build/refresh vector + scalar indexes for an existing database.
+    /// IVF vector indexes need data to train centroids — run this AFTER
+    /// bulk imports (init-time index creation on an empty table is skipped
+    /// by lancedb). Also compacts fragmented index segments.
+    Reindex {
+        #[arg(short, long)]
+        db: String,
+        /// Rebuild even if an index already exists (drop + recreate)
+        #[arg(long, default_value_t = false)]
+        force: bool,
+    },
+    /// Run environment / database health checks with fix hints
+    Doctor {
+        /// Database directory to check (schema, indexes, row counts)
+        #[arg(short, long)]
+        db: Option<String>,
+        /// Also probe a running server (REST /stats + /health)
+        #[arg(long)]
+        server: Option<String>,
+        /// Bearer token for --server (default: $SEMDOC_TOKEN)
+        #[arg(long)]
+        token: Option<String>,
+    },
     /// Show database stats
     Stats {
         #[arg(short, long)]
@@ -224,6 +247,8 @@ async fn main() -> Result<()> {
         Cmd::Add { db, server, token, file, text, source, metas } => add(db, server, token, file, text, source, metas).await,
         Cmd::Query { db, server, token, text, mode, limit, filter, filter_sql } => query(db, server, token, text, mode, limit, filter, filter_sql).await,
         Cmd::Delete { db, server, token, id, force } => delete(db, server, token, id, force).await,
+        Cmd::Reindex { db, force } => reindex(db, force).await,
+        Cmd::Doctor { db, server, token } => doctor(db, server, token).await,
         Cmd::Stats { db, server, token } => stats(db, server, token).await,
     }
 }
@@ -294,6 +319,149 @@ pub async fn check_schema_compat(db: &str, config: &SchemaConfig) -> Result<()> 
     }
     let physical = SchemaConfig::load_physical_fields(std::path::Path::new(&path))?;
     config.check_compatible_with(&physical)
+}
+
+/// Health checks with fix hints. Every failure is actionable — this
+/// encodes the operational pitfalls hit during development (embedder dim
+/// mismatch, lightrag down, TLS CA, schema drift, missing indexes).
+async fn doctor(db: Option<String>, server: Option<String>, token: Option<String>) -> Result<()> {
+    let mut failures = 0;
+    let ok = |name: &str, detail: &str| println!("✓ {name}: {detail}");
+    let bad = |name: &str, detail: &str| {
+        println!("✗ {name}: {detail}");
+    };
+    let warn = |name: &str, detail: &str| println!("⚠ {name}: {detail}");
+
+    // 1. deployment config
+    let deploy_path = std::env::var("SEMDOC_CONFIG").unwrap_or_else(|_| "./Config.toml".into());
+    match semdoc::config::DeploymentConfig::load(None) {
+        Ok(cfg) => {
+            ok("config", &format!("{deploy_path} loads"));
+            // 2. embedder probe (one real encode)
+            match semdoc::embedding::Embedder::load(&cfg.embedding) {
+                Ok(e) => match e.encode_blocking("doctor probe".into()).await {
+                    Ok(v) => ok("embedder", &format!("probe OK, dim={}", v.len())),
+                    Err(err) => {
+                        bad("embedder", &format!("probe failed: {err:#}"));
+                        failures += 1;
+                    }
+                },
+                Err(err) => {
+                    bad("embedder", &format!("{err:#}"));
+                    failures += 1;
+                }
+            }
+            // 3. reranker (optional — absence is fine)
+            match semdoc::reranker::Reranker::load(&cfg.rerank) {
+                Ok(_) => ok("reranker", "configured and loadable"),
+                Err(e) => {
+                    let m = format!("{e:#}");
+                    if m.contains("disabled by config") || m.contains("none") {
+                        warn("reranker", "disabled — queries degrade to ANN order");
+                    } else {
+                        bad("reranker", &m);
+                        failures += 1;
+                    }
+                }
+            }
+        }
+        Err(e) => {
+            bad("config", &format!("{e:#}"));
+            failures += 1;
+        }
+    }
+
+    // 4. database checks
+    if let Some(db) = &db {
+        match open_store(db).await {
+            Ok((store, config)) => {
+                ok("schema", &format!(
+                    "{} fields, {} vector cols, table `{}`",
+                    config.fields.len(),
+                    store.vector_fields.len(),
+                    store.table
+                ));
+                let rows = store.count().await?;
+                ok("lancedb", &format!("{rows} rows"));
+                for vf in &store.vector_fields {
+                    if vf.index == "none" && rows >= 50_000 {
+                        warn(
+                            &format!("vector index `{}`", vf.name),
+                            &format!(
+                                "brute-force over {rows} rows — set index=\"ivf_flat\" in schema.toml and run `semdoc reindex --db {db}`"
+                            ),
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                bad("database", &format!("{db}: {e:#}"));
+                failures += 1;
+            }
+        }
+    } else if db.is_none() && server.is_none() {
+        warn("database", "no --db given; skipping db checks");
+    }
+
+    // 5. server probe
+    if let Some(url) = &server {
+        let tok = token.clone().or_else(|| std::env::var("SEMDOC_TOKEN").ok());
+        match reqwest::blocking::Client::new()
+            .get(format!("{url}/stats"))
+            .apply_bearer(&tok)
+            .timeout(std::time::Duration::from_secs(5))
+            .send()
+        {
+            Ok(r) if r.status().is_success() => ok("server", &format!("{url} reachable")),
+            Ok(r) => {
+                bad("server", &format!("{url} HTTP {}", r.status()));
+                failures += 1;
+            }
+            Err(e) => {
+                bad("server", &format!("{url}: {e}"));
+                failures += 1;
+            }
+        }
+    }
+
+    // 6. graph plugin (from schema of the db if provided)
+    if let Some(db) = &db {
+        let cfg_path = format!("{db}/schema.toml");
+        if let Ok(config) = SchemaConfig::load(std::path::Path::new(&cfg_path)) {
+            let graph = semdoc::plugins::graph::build_graph_plugin(&config.plugins.graph).await?;
+            if graph.name() == "none" {
+                warn("graph", "not configured — query_graph degrades to semantic");
+            } else {
+                match graph.health().await {
+                    Ok(()) => ok("graph", &format!("{} backend healthy", graph.name())),
+                    Err(e) => {
+                        bad("graph", &format!("{}: {e:#}", graph.name()));
+                        println!("    hint: ./scripts/start-lightrag-server.sh --bg");
+                        failures += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if failures == 0 {
+        println!("doctor: all checks passed");
+    } else {
+        anyhow::bail!("doctor: {failures} check(s) failed");
+    }
+    Ok(())
+}
+
+trait Bearer {
+    fn apply_bearer(self, token: &Option<String>) -> reqwest::blocking::RequestBuilder;
+}
+impl Bearer for reqwest::blocking::RequestBuilder {
+    fn apply_bearer(self, token: &Option<String>) -> reqwest::blocking::RequestBuilder {
+        match token {
+            Some(t) => self.bearer_auth(t),
+            None => self,
+        }
+    }
 }
 
 fn parse_metas(metas: &[String], config: &SchemaConfig) -> Result<serde_json::Map<String, serde_json::Value>> {
@@ -681,6 +849,76 @@ async fn stats(db: Option<String>, server: Option<String>, token: Option<String>
     }
     let db = db.expect("clap: db or server required");
     let (store, _config) = open_store(&db).await?;
-    println!("rows: {}", store.count().await?);
+    let rows = store.count().await?;
+    println!("rows: {rows}");
+    // Nudge before the brute-force scan cliff: ANN with index="none" is
+    // linear over all rows; IVF turns it into ~sqrt. 50k is where the
+    // p50 latency becomes noticeable (~100ms+ per query on CPU).
+    if rows >= 50_000 {
+        for vf in &store.vector_fields {
+            if vf.index == "none" {
+                eprintln!(
+                    "[hint] vector column `{}` has index=\"none\" with {rows} rows — queries \
+brute-force scan the table. Set index=\"ivf_flat\" in schema.toml and run: \
+semdoc reindex --db {db}",
+                    vf.name
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Build vector indexes for columns configured with ivf_flat/ivf_pq, then
+/// optimize (compaction + FTS/BTree delta indexing). Safe to re-run.
+async fn reindex(db: String, force: bool) -> Result<()> {
+    let (store, _config) = open_store(&db).await?;
+    let t = store.conn.open_table(&store.table).execute().await?;
+    let rows = store.count().await?;
+    println!("reindexing {db} ({rows} rows)");
+    let mut built = 0;
+    for vf in &store.vector_fields {
+        if vf.index == "none" {
+            println!("  {}: no vector index configured (brute-force) — skipped", vf.name);
+            continue;
+        }
+        if rows < 256 {
+            println!(
+                "  {}: only {rows} rows — IVF training needs >=256; skipping (brute force is faster at this size)",
+                vf.name
+            );
+            continue;
+        }
+        let kind = vf.index.as_str();
+        if force {
+            // List and drop any existing index on this column first.
+            let idx_names = t.list_indices().await?;
+            for idx in idx_names {
+                if idx.columns.len() == 1 && idx.columns[0] == vf.name {
+                    println!("  {}: dropping existing index `{}`", vf.name, idx.name);
+                    t.drop_index(&idx.name).await?;
+                }
+            }
+        }
+        let res = store.ensure_vector_indexes().await;
+        match res {
+            Ok(()) => {
+                println!("  {}: {kind} index ready", vf.name);
+                built += 1;
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                if msg.contains("already exists") {
+                    println!("  {}: {kind} index already exists (use --force to rebuild)", vf.name);
+                } else {
+                    eprintln!("  {}: {kind} index FAILED: {msg}", vf.name);
+                }
+            }
+        }
+    }
+    store.optimize_indices().await?;
+    println!(
+        "done: {built} vector index built/verified, optimize (compaction + FTS/BTree deltas) complete"
+    );
     Ok(())
 }

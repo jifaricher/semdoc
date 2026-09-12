@@ -131,6 +131,38 @@ pub struct ServerConfig {
     /// Require `Authorization: Bearer <$token_env>`.
     #[serde(default)]
     pub token_env: Option<String>,
+    /// POST a JSON event here after every successful write (add / delete /
+    /// update). Fire-and-forget: failures log to stderr, never fail the
+    /// original operation.
+    #[serde(default)]
+    pub webhook_url: Option<String>,
+    /// Which events to deliver. Default = all of `add`,`delete`,`update`.
+    #[serde(default)]
+    pub webhook_events: Option<Vec<String>>,
+    /// Env var naming the HMAC-SHA256 secret for the
+    /// `X-Semdoc-Signature: sha256=<hex>` header. Required for the
+    /// receiver to authenticate the call — without a secret the receiver
+    /// cannot tell semdoc from an intruder.
+    #[serde(default)]
+    pub webhook_secret_env: Option<String>,
+}
+
+impl ServerConfig {
+    /// Whether a webhook event kind is enabled. `None` url → off.
+    pub fn webhook_enabled(&self, event: &str) -> bool {
+        match (&self.webhook_url, &self.webhook_events) {
+            (None, _) => false,
+            (Some(_), None) => true,
+            (Some(_), Some(list)) => list.iter().any(|e| e == event),
+        }
+    }
+
+    pub fn webhook_secret(&self) -> Option<String> {
+        self.webhook_secret_env
+            .as_ref()
+            .and_then(|e| std::env::var(e).ok())
+            .filter(|s| !s.is_empty())
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default, PartialEq)]
@@ -625,7 +657,7 @@ category = { type = "string" }
         with_clean_env(|| {
             let cfg = DeploymentConfig {
                 rerank: RerankConfig::None,
-                server: ServerConfig { token_env: Some("SEMDOC_TEST_TOKEN".into()), listen: None },
+                server: ServerConfig { token_env: Some("SEMDOC_TEST_TOKEN".into()), listen: None, ..Default::default() },
                 ..Default::default()
             };
             let err = cfg.validate().unwrap_err();
@@ -836,7 +868,7 @@ size = 300
         with_clean_env(|| {
             let cfg = DeploymentConfig {
                 rerank: RerankConfig::None,
-                server: ServerConfig { token_env: Some("SEMDOC_TEST_TOKEN".into()), listen: None },
+                server: ServerConfig { token_env: Some("SEMDOC_TEST_TOKEN".into()), listen: None, ..Default::default() },
                 ..Default::default()
             };
             std::env::set_var("SEMDOC_TEST_TOKEN", "tok");

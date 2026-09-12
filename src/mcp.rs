@@ -43,6 +43,68 @@ fn check_db_schema_compat(db: &str, config: &SchemaConfig) -> Result<()> {
 /// `dispatch`/`tools_list` through it.
 pub type SharedServer = std::sync::Arc<Server>;
 
+/// Webhook sink configured by the host binary (semdoc-server reads
+/// [server] from Config.toml and registers it at startup; stdio/CLI have
+/// no webhook config and skip registration).
+static WEBHOOK: std::sync::OnceLock<crate::config::ServerConfig> = std::sync::OnceLock::new();
+
+pub fn register_webhooks(cfg: crate::config::ServerConfig) {
+    let _ = WEBHOOK.set(cfg);
+}
+
+/// Fire-and-forget event delivery. Never fails the caller; malformed
+/// config or unreachable receivers only log. Payload is HMAC-signed when
+/// a secret is configured so receivers can authenticate the source.
+pub fn fire_event(event: &str, doc_id: &str, extra: serde_json::Value) {
+    let Some(cfg) = WEBHOOK.get() else { return };
+    if !cfg.webhook_enabled(event) {
+        return;
+    }
+    let Some(url) = cfg.webhook_url.clone() else { return };
+    let secret = cfg.webhook_secret();
+    let event = event.to_string();
+    let doc_id = doc_id.to_string();
+    tokio::spawn(async move {
+        let body = serde_json::json!({
+            "event": event,
+            "doc_id": doc_id,
+            "ts": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+            "data": extra,
+        });
+        let body = match serde_json::to_string(&body) {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let client = match crate::tls::apply_async(reqwest::Client::builder())
+            .timeout(std::time::Duration::from_secs(5))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("[webhook] client build failed: {e}");
+                return;
+            }
+        };
+        let mut req = client.post(&url).header("content-type", "application/json");
+        if let Some(sec) = &secret {
+            use hmac::{Hmac, Mac};
+            let mut mac = Hmac::<sha2::Sha256>::new_from_slice(sec.as_bytes())
+                .expect("hmac accepts any key length");
+            mac.update(body.as_bytes());
+            let sig = format!("sha256={:x}", mac.finalize().into_bytes());
+            req = req.header("X-Semdoc-Signature", sig);
+        }
+        match req.body(body).send().await {
+            Ok(r) if r.status().is_success() => {}
+            Ok(r) => eprintln!("[webhook] {event} → {url}: HTTP {}", r.status()),
+            Err(e) => eprintln!("[webhook] {event} → {url}: {e}"),
+        }
+    });
+}
+
 impl Server {
     pub async fn new(db: &str, with_rerank: bool, deploy_config: Option<&str>) -> Result<Self> {
         let cfg_path = format!("{db}/schema.toml");
@@ -595,6 +657,11 @@ async fn add_document(server: &Server, args: &Value) -> Value {
             }
         }
     }
+    fire_event(
+        "add",
+        &doc_id,
+        json!({ "chunks": leaves.len(), "replaced": replaced }),
+    );
     json!({
         "content": [{ "type": "text", "text": format!(
             "文档已写入，id: {doc_id}（chunks: {}）{}{graph_note}",
@@ -633,6 +700,7 @@ pub async fn delete_doc_checked(server: &Server, id: &str) -> Result<String> {
             }
         }
     }
+    fire_event("delete", &target, json!({}));
     Ok(format!("文档 {target} 已删除（chunks 级联清理）{note}"))
 }
 
@@ -717,9 +785,12 @@ async fn update_document_metadata(server: &Server, args: &Value) -> Value {
         .update_metadata(id, &updates, cascade)
         .await
     {
-        Ok(n) => json!({
-            "content": [{ "type": "text", "text": format!("已更新 {n} 行（id={id}, cascade={cascade}）") }]
-        }),
+        Ok(n) => {
+            fire_event("update", id, json!({ "rows": n, "cascade": cascade }));
+            json!({
+                "content": [{ "type": "text", "text": format!("已更新 {n} 行（id={id}, cascade={cascade}）") }]
+            })
+        }
         Err(e) => err(format!("update failed: {e:#}")),
     }
 }
