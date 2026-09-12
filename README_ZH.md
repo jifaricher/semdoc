@@ -19,10 +19,26 @@ semdoc 是 semrag 的第二版：一个通用向量知识库，**schema 是配�
 ```bash
 semdoc init   --schema schema.toml --db /path/to/db    # 初始化库
 semdoc add    --db /path/to/db --file doc.md [--meta K=V]
-semdoc query  --db /path/to/db -t "查询" [--mode semantic|fts|rerank] [--filter '{"domain":"mm"}']
+semdoc query  --db /path/to/db -t "查询" [--mode semantic|parent|fts|rerank] [--filter '{"domain":"mm"}']
 semdoc delete --db /path/to/db --id <文档id> [--force]  # 删除（级联父/子/lightrag）
 semdoc stats  --db /path/to/db
 ```
+
+**远程模式（`--server`）**：除 `init` 外的所有子命令都可连一台运行中的
+semdoc-server 而不是打开本地库（`--server <URL>` 与 `--db` 二选一）：
+
+```bash
+export SEMDOC_TOKEN=<server 的 bearer token>
+semdoc stats  --server http://127.0.0.1:8094
+semdoc add    --server http://127.0.0.1:8094 --file doc.md --meta K=V
+semdoc query  --server http://127.0.0.1:8094 -t "查询" --mode rerank --filter '{"domain":"mm"}'
+semdoc delete --server http://127.0.0.1:8094 --id <id>
+```
+
+- token 来源：`--token` > `SEMDOC_TOKEN` 环境变量
+- `--filter`（Mongo-style JSON）原样发给 server，由服务端按库 schema 编译——行为与本地一致
+- `--filter-sql` 在远程模式**被拒绝**（raw SQL 是受信输入，不跨网络传输）
+- 远程模式下 replace_key 替换、lightrag 镜像、busy 重试都发生在 server 侧
 
 `delete` 说明：
 
