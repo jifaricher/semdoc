@@ -97,6 +97,20 @@ pub struct FieldConfig {
     /// Reject writes missing this field.
     #[serde(default)]
     pub required: bool,
+    /// Replacement key: when `add` writes a document whose values for ALL
+    /// `replace_key = true` fields match an existing parent row, that row
+    /// (and its leaf chunks, and the lightrag mirror) is deleted first —
+    /// "upsert by business identity" instead of append. Multiple keys are
+    /// AND-ed; every key must be a string field. Example:
+    /// `source_path = { type = "string", index = true, replace_key = true }`.
+    #[serde(default)]
+    pub replace_key: bool,
+}
+
+impl FieldConfig {
+    pub fn new(t: &str) -> Self {
+        FieldConfig { r#type: t.to_string(), index: false, required: false, replace_key: false }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Default)]
@@ -179,16 +193,15 @@ fn default_insert_concurrency() -> usize {
     4
 }
 
-/// Reserved (non-configurable) columns present in every database. Everything
-/// else must come from `[fields]`.
+/// Pipeline-reserved columns present in every database. These implement the
+/// retrieval mechanism itself (chunk hierarchy, dedup, expansion) and cannot
+/// be declared or overridden in `[fields]`.
 pub const RESERVED_COLUMNS: &[&str] = &[
     "id",
     "raw_text",
     "chunk_level",
     "chunk_index",
     "parent_doc_id",
-    "source_path",
-    "source_type",
 ];
 
 impl SchemaConfig {
@@ -288,7 +301,90 @@ impl SchemaConfig {
                 );
             }
         }
+
+        // Replacement keys: every `replace_key = true` field must be a
+        // string. Multiple keys are AND-ed at replace time.
+        for (name, fc) in &self.fields {
+            if fc.replace_key && fc.r#type != "string" {
+                anyhow::bail!(
+                    "field `{name}`: replace_key requires type `string` (got `{}`)",
+                    fc.r#type
+                );
+            }
+        }
         Ok(())
+    }
+
+    /// Fields flagged as replacement keys, in declaration order. Empty when
+    /// the schema opts out of replace-on-add semantics.
+    pub fn replace_key_fields(&self) -> Vec<&str> {
+        self.fields
+            .iter()
+            .filter(|(_, fc)| fc.replace_key)
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+
+    /// Compare this config against the physical field set a database was
+    /// created with (name -> type). Returns Err listing the differences.
+    /// `id`-level identity is not required — index flags and other metadata
+    /// may evolve — but the column set and types must match exactly.
+    pub fn check_compatible_with(
+        &self,
+        physical: &std::collections::BTreeMap<String, String>,
+    ) -> anyhow::Result<()> {
+        let mine: std::collections::BTreeMap<String, String> = self
+            .fields
+            .iter()
+            .map(|(k, v)| (k.clone(), v.r#type.clone()))
+            .collect();
+        let missing: Vec<&String> = physical.keys().filter(|k| !mine.contains_key(*k)).collect();
+        let extra: Vec<&String> = mine.keys().filter(|k| !physical.contains_key(*k)).collect();
+        let mut errs = Vec::new();
+        if !missing.is_empty() {
+            errs.push(format!(
+                "schema no longer declares column(s) present in the database: {}",
+                missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if !extra.is_empty() {
+            errs.push(format!(
+                "schema declares column(s) absent from the database: {}",
+                extra.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        for (k, t) in &mine {
+            if let Some(pt) = physical.get(k) {
+                if pt != t {
+                    errs.push(format!("column `{k}` type changed: db has `{pt}`, schema says `{t}`"));
+                }
+            }
+        }
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!("schema/database mismatch:\n  - {}", errs.join("\n  - "))
+        }
+    }
+
+    /// Parse a physical-fields TOML file (name = "type" lines) written by
+    /// `semdoc init`.
+    pub fn load_physical_fields(path: &std::path::Path) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("read physical schema {}: {e}", path.display()))?;
+        let value: toml::Value = toml::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("parse physical schema {}: {e}", path.display()))?;
+        let mut out = std::collections::BTreeMap::new();
+        if let Some(fields) = value.get("fields").and_then(|f| f.as_table()) {
+            for (name, def) in fields {
+                let t = def
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("physical schema: field `{name}` missing type"))?;
+                out.insert(name.clone(), t.to_string());
+            }
+        }
+        Ok(out)
     }
 
     /// Default single-vector field used when `[vector].fields` is empty:

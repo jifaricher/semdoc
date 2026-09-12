@@ -23,6 +23,21 @@ pub struct Server {
     pub graph: Box<dyn crate::plugins::graph::GraphPlugin>,
 }
 
+/// Verify the incoming schema against `<db>/physical_fields.toml`. Databases
+/// without a snapshot (created before compat checking) pass with a warning.
+fn check_db_schema_compat(db: &str, config: &SchemaConfig) -> Result<()> {
+    let path = format!("{db}/physical_fields.toml");
+    if !std::path::Path::new(&path).exists() {
+        eprintln!(
+            "[compat] {path} missing — database predates schema-compat snapshots; \
+             skipping column check (re-init or migrate to enable it)"
+        );
+        return Ok(());
+    }
+    let physical = SchemaConfig::load_physical_fields(std::path::Path::new(&path))?;
+    config.check_compatible_with(&physical)
+}
+
 /// Shared state shape used by both the stdio bin and the HTTP server:
 /// one Server owns the engine + graph; hosts keep it in an Arc and call
 /// `dispatch`/`tools_list` through it.
@@ -32,6 +47,7 @@ impl Server {
     pub async fn new(db: &str, with_rerank: bool, deploy_config: Option<&str>) -> Result<Self> {
         let cfg_path = format!("{db}/schema.toml");
         let config = SchemaConfig::load(std::path::Path::new(&cfg_path))?;
+        check_db_schema_compat(db, &config)?;
         let vec_fields = config.effective_vector_fields(1024);
         let conn = lancedb::connect(db).execute().await?;
         let store = Store::new_existing(
@@ -365,6 +381,64 @@ async fn add_document(server: &Server, args: &Value) -> Value {
         let is_md = source_path.ends_with(".md") || source_path.ends_with(".markdown");
         Some(if is_md { "markdown".to_string() } else { "plain".to_string() })
     };
+    // Feed source_path/source_type into extra when the schema declares them
+    // (they are ordinary [fields] now; the Record-level fields exist for
+    // backward compatibility with the fixed columns of older databases).
+    if server.engine.config.fields.contains_key("source_path") {
+        extra.entry("source_path".to_string())
+            .or_insert_with(|| Value::String(source_path.to_string()));
+    }
+    if server.engine.config.fields.contains_key("source_type") {
+        extra.entry("source_type".to_string())
+            .or_insert_with(|| Value::String(source_type.clone()));
+    }
+    // Replace-on-add: when the schema flags replace_key fields and every one
+    // of them is present in this write, delete the matching old version
+    // (parent + leaf chunks, lightrag mirror) before writing.
+    let mut replaced: Option<String> = None;
+    let rk = server.engine.config.replace_key_fields();
+    if !rk.is_empty() {
+        let mut conds = Vec::new();
+        let mut all_present = true;
+        for k in &rk {
+            match extra.get(*k) {
+                Some(v) => {
+                    let s = v.as_str().unwrap_or_default().replace('\'', "''");
+                    conds.push(format!("{k} = '{s}'"));
+                }
+                None => {
+                    all_present = false;
+                    break;
+                }
+            }
+        }
+        if all_present {
+            let sql = conds.join(" AND ");
+            match server.engine.store.find_parents_by(&sql).await {
+                Ok(old) => {
+                    for p in old {
+                        if p.id == doc_id {
+                            continue;
+                        }
+                        if let Err(e) = server.engine.store.delete_by_id(&p.id).await {
+                            eprintln!("[add] replace: failed to delete old {}: {e:#}", p.id);
+                            continue;
+                        }
+                        if server.graph.name() != "none" {
+                            if let Err(e) = server.graph.delete(&p.id).await {
+                                eprintln!(
+                                    "[add] replace: graph delete degraded for {}: {e:#}",
+                                    p.id
+                                );
+                            }
+                        }
+                        replaced = Some(p.id);
+                    }
+                }
+                Err(e) => eprintln!("[add] replace lookup failed: {e:#}"),
+            }
+        }
+    }
     let doc = crate::store::InputDoc {
         id: doc_id.clone(),
         raw_text: text.to_string(),
@@ -522,7 +596,11 @@ async fn add_document(server: &Server, args: &Value) -> Value {
         }
     }
     json!({
-        "content": [{ "type": "text", "text": format!("文档已写入，id: {doc_id}（chunks: {}）{graph_note}", leaves.len()) }]
+        "content": [{ "type": "text", "text": format!(
+            "文档已写入，id: {doc_id}（chunks: {}）{}{graph_note}",
+            leaves.len(),
+            replaced.as_ref().map(|old| format!("（已按 replace_key 替换旧版本 {old}）")).unwrap_or_default(),
+        ) }]
     })
 }
 

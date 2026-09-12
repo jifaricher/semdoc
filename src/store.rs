@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! LanceDB storage with a **configuration-driven Arrow schema**.
 //!
-//! Fixed reserved columns (id / raw_text / chunk_level / chunk_index /
-//! parent_doc_id / source_path / source_type) + `[fields]` scalar columns +
+//! Pipeline-reserved columns (id / raw_text / chunk_level / chunk_index /
+//! parent_doc_id) + `[fields]` scalar columns (legacy source_path/source_type
+//! auto-injected for old databases; see SchemaConfig::effective_fields) +
 //! `[vector]` FixedSizeList columns, all derived from [`SchemaConfig`].
 //!
 //! Small-to-big retrieval: writes produce a parent row (chunk_level=0) plus
@@ -25,15 +26,7 @@ use std::sync::Arc;
 
 use crate::schema::{FieldConfig, SchemaConfig, VectorFieldConfig};
 
-pub const RESERVED_COLUMNS: &[&str] = &[
-    "id",
-    "raw_text",
-    "chunk_level",
-    "chunk_index",
-    "parent_doc_id",
-    "source_path",
-    "source_type",
-];
+pub use crate::schema::RESERVED_COLUMNS;
 
 /// A document to store. `extra` carries the user-defined `[fields]` values
 /// keyed by field name; vector columns are filled by the write pipeline
@@ -100,8 +93,6 @@ impl Store {
         let mut fields: Vec<Field> = vec![
             Field::new("id", DataType::Utf8, false),
             Field::new("raw_text", DataType::Utf8, false),
-            Field::new("source_path", DataType::Utf8, false),
-            Field::new("source_type", DataType::Utf8, false),
             Field::new("chunk_level", DataType::UInt8, false),
             Field::new("chunk_index", DataType::UInt32, false),
             Field::new("parent_doc_id", DataType::Utf8, true),
@@ -241,15 +232,21 @@ impl Store {
             // Reserved columns
             set_str(builders.get_mut("id"), &rec.id);
             set_str(builders.get_mut("raw_text"), &rec.raw_text);
-            set_str(builders.get_mut("source_path"), &rec.source_path);
-            set_str(builders.get_mut("source_type"), &rec.source_type);
             set_str_opt(builders.get_mut("parent_doc_id"), rec.parent_doc_id.as_deref());
             set_u8(builders.get_mut("chunk_level"), rec.chunk_level);
             set_u32(builders.get_mut("chunk_index"), rec.chunk_index);
 
-            // User scalar fields
+            // User scalar fields. source_path/source_type come from the
+            // Record-level fields when the schema declares them (write paths
+            // may also override via extra).
+            let fallback_sp = Value::String(rec.source_path.clone());
+            let fallback_st = Value::String(rec.source_type.clone());
             for (name, fc) in &self.scalar_fields {
-                let v = rec.extra.get(name);
+                let v = rec.extra.get(name).or(match name.as_str() {
+                    "source_path" => Some(&fallback_sp),
+                    "source_type" => Some(&fallback_st),
+                    _ => None,
+                });
                 set_scalar(builders.get_mut(name).ok_or_else(|| anyhow::anyhow!("no builder for {name}"))?, fc, v)?;
             }
 
@@ -373,8 +370,6 @@ impl Store {
             "chunk_level".into(),
             "chunk_index".into(),
             "parent_doc_id".into(),
-            "source_path".into(),
-            "source_type".into(),
         ];
         for name in self.scalar_fields.keys() {
             projection.push(name.clone());
@@ -460,6 +455,21 @@ impl Store {
             );
         }
         Ok(out)
+    }
+
+    /// Parent rows matching a caller-built SQL predicate (replace-on-add
+    /// lookup: `field = 'v' AND field2 = 'v2'` over replace_key columns).
+    /// The predicate is composed by the write path from validated schema
+    /// field names; values are SQL-escaped there.
+    pub async fn find_parents_by(&self, sql: &str) -> Result<Vec<Record>> {
+        let t = self.conn.open_table(&self.table).execute().await?;
+        let results = t
+            .query()
+            .only_if(format!("chunk_level = 0 AND {sql}"))
+            .limit(Self::ALL_PARENTS_CAP)
+            .execute()
+            .await?;
+        records_from_stream(results, &self.scalar_fields).await
     }
 
     /// Fetch a single row by id (leaf or parent).
@@ -733,8 +743,10 @@ async fn records_from_stream(
             .ok_or_else(|| anyhow::anyhow!("chunk_index not u32"))?
             .clone();
         let parents = str_col(&batch, "parent_doc_id")?;
-        let paths = str_col(&batch, "source_path")?;
-        let stypes = str_col(&batch, "source_type")?;
+        // source_path/source_type are optional [fields] columns now; absent
+        // columns (fresh schemas that don't declare them) yield "".
+        let paths = opt_str_col(&batch, "source_path");
+        let stypes = opt_str_col(&batch, "source_type");
 
         for i in 0..batch.num_rows() {
             let mut extra = serde_json::Map::new();
@@ -782,8 +794,8 @@ async fn records_from_stream(
                 chunk_level: levels.value(i),
                 chunk_index: indexes.value(i),
                 parent_doc_id: (!parents.is_null(i)).then(|| parents.value(i).to_string()),
-                source_path: paths.value(i).to_string(),
-                source_type: stypes.value(i).to_string(),
+                source_path: paths.as_ref().map(|a| a.value(i).to_string()).unwrap_or_default(),
+                source_type: stypes.as_ref().map(|a| a.value(i).to_string()).unwrap_or_default(),
                 extra,
             });
         }
@@ -818,6 +830,12 @@ fn json_value_to_sql_lit(name: &str, v: &serde_json::Value) -> Result<String> {
         }
         other => Err(anyhow::anyhow!("unsupported metadata value {other}")),
     }
+}
+
+fn opt_str_col(batch: &RecordBatch, name: &str) -> Option<StringArray> {
+    batch
+        .column_by_name(name)
+        .and_then(|c| c.as_any().downcast_ref::<StringArray>().cloned())
 }
 
 fn str_col(batch: &RecordBatch, name: &str) -> Result<StringArray> {
@@ -859,8 +877,8 @@ mod tests {
                 }],
             },
             fields: [
-                ("category".to_string(), FieldConfig { r#type: "string".into(), index: true, required: false }),
-                ("keywords".to_string(), FieldConfig { r#type: "list<string>".into(), index: false, required: false }),
+                ("category".to_string(), FieldConfig { r#type: "string".into(), index: true, required: false, replace_key: false }),
+                ("keywords".to_string(), FieldConfig { r#type: "list<string>".into(), index: false, required: false, replace_key: false }),
             ]
             .into_iter()
             .collect(),
@@ -1160,8 +1178,8 @@ mod tests {
             .unwrap();
         let cfg = SchemaConfig {
             fields: [
-                ("summary".to_string(), FieldConfig { r#type: "text".into(), index: false, required: false }),
-                ("category".to_string(), FieldConfig { r#type: "string".into(), index: true, required: false }),
+                ("summary".to_string(), FieldConfig { r#type: "text".into(), index: false, required: false, replace_key: false }),
+                ("category".to_string(), FieldConfig { r#type: "string".into(), index: true, required: false, replace_key: false }),
             ]
             .into_iter()
             .collect(),
@@ -1220,5 +1238,104 @@ mod tests {
         let parents = store.all_parents().await.unwrap();
         assert_eq!(parents.len(), 1);
         assert_eq!(parents[0].chunk_level, 0);
+    }
+
+    #[tokio::test]
+    async fn find_parents_by_matches_all_conditions() {
+        let (_dir, store) = test_store().await;
+        let mut e1 = serde_json::Map::new();
+        e1.insert("category".into(), Value::String("mm".into()));
+        store
+            .upsert_doc(parent_record("p1", "doc one", e1), vec![], &leaf_vectors(1.0), &Default::default())
+            .await
+            .unwrap();
+        let mut e2 = serde_json::Map::new();
+        e2.insert("category".into(), Value::String("net".into()));
+        store
+            .upsert_doc(parent_record("p2", "doc two", e2), vec![], &leaf_vectors(0.5), &Default::default())
+            .await
+            .unwrap();
+
+        // AND semantics: one match.
+        let hits = store.find_parents_by("category = 'mm'").await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].id, "p1");
+        // No match.
+        let hits = store.find_parents_by("category = 'sched'").await.unwrap();
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn replace_key_validation_and_lookup() {
+        // replace_key on non-string field is rejected.
+        let bad: SchemaConfig = toml::from_str(
+            r#"
+[fields]
+priority = { type = "int64", replace_key = true }
+"#,
+        )
+        .unwrap();
+        assert!(bad.validate().is_err());
+
+        // Declared string replace keys are discoverable.
+        let ok: SchemaConfig = toml::from_str(
+            r#"
+[fields]
+source_path = { type = "string", index = true, replace_key = true }
+source_type = { type = "string", replace_key = true }
+"#,
+        )
+        .unwrap();
+        ok.validate().unwrap();
+        assert_eq!(ok.replace_key_fields(), vec!["source_path", "source_type"]);
+    }
+
+    #[test]
+    fn schema_compat_check_detects_column_drift() {
+        // Old database had source_path/source_type as physical columns.
+        let physical: std::collections::BTreeMap<String, String> = [
+            ("source_path".to_string(), "string".to_string()),
+            ("source_type".to_string(), "string".to_string()),
+            ("domain".to_string(), "string".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        // Matching schema passes.
+        let ok: SchemaConfig = toml::from_str(
+            r#"
+[fields]
+source_path = { type = "string" }
+source_type = { type = "string" }
+domain = { type = "string" }
+"#,
+        )
+        .unwrap();
+        ok.validate().unwrap();
+        ok.check_compatible_with(&physical).unwrap();
+
+        // Dropping a physical column fails with a clear error.
+        let drifted: SchemaConfig = toml::from_str(
+            r#"
+[fields]
+domain = { type = "string" }
+"#,
+        )
+        .unwrap();
+        let err = drifted.check_compatible_with(&physical).unwrap_err();
+        assert!(err.to_string().contains("no longer declares"), "{err}");
+
+        // Type change fails.
+        let typed: SchemaConfig = toml::from_str(
+            r#"
+[fields]
+source_path = { type = "text" }
+source_type = { type = "string" }
+domain = { type = "string" }
+"#,
+        )
+        .unwrap();
+        let err = typed.check_compatible_with(&physical).unwrap_err();
+        assert!(err.to_string().contains("type changed"), "{err}");
     }
 }

@@ -203,13 +203,23 @@ async fn add_doc(
     if !auth_ok(&state, &headers) {
         return Err((StatusCode::UNAUTHORIZED, "unauthorized".into()));
     }
+    let source_path = body.source_path.unwrap_or_else(|| "inline".into());
+    let mut extra: serde_json::Map<String, Value> = body.meta;
+    if state.mcp.engine.config.fields.contains_key("source_path") {
+        extra.entry("source_path".to_string())
+            .or_insert_with(|| Value::String(source_path.clone()));
+    }
+    if state.mcp.engine.config.fields.contains_key("source_type") {
+        extra.entry("source_type".to_string())
+            .or_insert_with(|| Value::String("text".to_string()));
+    }
     let doc = InputDoc {
         id: blake3::hash(body.text.as_bytes()).to_hex().to_string(),
         raw_text: body.text.clone(),
-        source_path: body.source_path.unwrap_or_else(|| "inline".into()),
+        source_path,
         source_type: "text".into(),
         language: Some("markdown".into()),
-        extra: body.meta,
+        extra,
         vectors: Default::default(),
     };
     semdoc_bin_helpers::write_doc(&state.mcp.engine.store, &state.mcp.engine.embedder, doc)

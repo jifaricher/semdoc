@@ -516,12 +516,12 @@ mod tests {
                 }],
             },
             fields: [
-                ("category".to_string(), FieldConfig { r#type: "string".into(), index: true, required: false }),
-                ("score".to_string(), FieldConfig { r#type: "float32".into(), index: true, required: false }),
-                ("priority".to_string(), FieldConfig { r#type: "int64".into(), index: false, required: false }),
-                ("verified".to_string(), FieldConfig { r#type: "bool".into(), index: false, required: false }),
-                ("keywords".to_string(), FieldConfig { r#type: "list<string>".into(), index: false, required: false }),
-                ("notes".to_string(), FieldConfig { r#type: "text".into(), index: false, required: false }),
+                ("category".to_string(), FieldConfig { r#type: "string".into(), index: true, required: false, replace_key: false }),
+                ("score".to_string(), FieldConfig { r#type: "float32".into(), index: true, required: false, replace_key: false }),
+                ("priority".to_string(), FieldConfig { r#type: "int64".into(), index: false, required: false, replace_key: false }),
+                ("verified".to_string(), FieldConfig { r#type: "bool".into(), index: false, required: false, replace_key: false }),
+                ("keywords".to_string(), FieldConfig { r#type: "list<string>".into(), index: false, required: false, replace_key: false }),
+                ("notes".to_string(), FieldConfig { r#type: "text".into(), index: false, required: false, replace_key: false }),
             ]
             .into_iter()
             .collect(),
@@ -820,7 +820,7 @@ mod tests {
         // No `text` fields here: they'd make create_indices build a
         // multi-column FTS index, which this lancedb version rejects.
         let cfg = SchemaConfig {
-            fields: [("category".to_string(), FieldConfig { r#type: "string".into(), index: true, required: false })]
+            fields: [("category".to_string(), FieldConfig { r#type: "string".into(), index: true, required: false, replace_key: false })]
                 .into_iter()
                 .collect(),
             ..test_schema()
