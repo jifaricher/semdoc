@@ -55,6 +55,19 @@ pub fn register_webhooks(cfg: crate::config::ServerConfig) {
 /// Fire-and-forget event delivery. Never fails the caller; malformed
 /// config or unreachable receivers only log. Payload is HMAC-signed when
 /// a secret is configured so receivers can authenticate the source.
+/// `X-Semdoc-Signature` value: `sha256=<hex>` HMAC of the exact request
+/// body. Exposed as a pure function so the wire format is testable.
+pub fn sign_body(body: &str, secret: &str) -> Option<String> {
+    if secret.is_empty() {
+        return None;
+    }
+    use hmac::{Hmac, Mac};
+    let mut mac = Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes())
+        .expect("hmac accepts any key length");
+    mac.update(body.as_bytes());
+    Some(format!("sha256={:x}", mac.finalize().into_bytes()))
+}
+
 pub fn fire_event(event: &str, doc_id: &str, extra: serde_json::Value) {
     let Some(cfg) = WEBHOOK.get() else { return };
     if !cfg.webhook_enabled(event) {
@@ -89,12 +102,7 @@ pub fn fire_event(event: &str, doc_id: &str, extra: serde_json::Value) {
             }
         };
         let mut req = client.post(&url).header("content-type", "application/json");
-        if let Some(sec) = &secret {
-            use hmac::{Hmac, Mac};
-            let mut mac = Hmac::<sha2::Sha256>::new_from_slice(sec.as_bytes())
-                .expect("hmac accepts any key length");
-            mac.update(body.as_bytes());
-            let sig = format!("sha256={:x}", mac.finalize().into_bytes());
+        if let Some(sig) = sign_body(&body, secret.as_deref().unwrap_or("")) {
             req = req.header("X-Semdoc-Signature", sig);
         }
         match req.body(body).send().await {
@@ -1065,5 +1073,45 @@ pub async fn handle_request(server: &Server, method: &str, params: &Value) -> Va
         other => json!({
             "error": { "code": -32601, "message": format!("method not found: {other}") }
         }),
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sign_body_deterministic_and_prefixed() {
+        let body = r#"{"event":"add","doc_id":"abc"}"#;
+        let a = sign_body(body, "secret").unwrap();
+        let b = sign_body(body, "secret").unwrap();
+        assert_eq!(a, b, "same body+key must produce identical signature");
+        assert!(a.starts_with("sha256="), "signature must carry the scheme prefix");
+        assert_ne!(sign_body(body, "other-key").unwrap(), a, "different key must differ");
+    }
+
+    #[test]
+    fn sign_body_matches_reference_vector() {
+        // RFC 4231-style cross-check with an independently computed value:
+        // hmac_sha256(key=b"key", msg=b"The quick brown fox jumps over the lazy dog")
+        // = f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8
+        let sig = sign_body("The quick brown fox jumps over the lazy dog", "key").unwrap();
+        assert_eq!(
+            sig,
+            "sha256=f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8"
+        );
+    }
+
+    #[test]
+    fn sign_body_empty_secret_is_none() {
+        assert!(sign_body("body", "").is_none());
+    }
+
+    #[test]
+    fn sign_body_covers_body_changes() {
+        let a = sign_body(r#"{"n":1}"#, "k").unwrap();
+        let b = sign_body(r#"{"n":2}"#, "k").unwrap();
+        assert_ne!(a, b, "tampered body must fail verification");
     }
 }
