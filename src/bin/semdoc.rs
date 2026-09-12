@@ -27,6 +27,77 @@ struct Args {
     cmd: Cmd,
 }
 
+/// Remote backend: talk to a running semdoc-server over its REST API
+/// instead of opening the LanceDB directory directly.
+#[derive(Clone)]
+struct Remote {
+    base: String,
+    token: Option<String>,
+    http: reqwest::blocking::Client,
+}
+
+impl Remote {
+    fn new(base: &str, token: Option<String>) -> Result<Self> {
+        Ok(Self {
+            base: base.trim_end_matches('/').to_string(),
+            token,
+            http: semdoc::tls::apply_blocking(reqwest::blocking::Client::builder())
+                .timeout(std::time::Duration::from_secs(300))
+                .build()?,
+        })
+    }
+
+    fn req(&self, method: reqwest::Method, path: &str) -> reqwest::blocking::RequestBuilder {
+        let mut r = self.http.request(method, format!("{}{path}", self.base));
+        if let Some(t) = &self.token {
+            r = r.bearer_auth(t);
+        }
+        r
+    }
+
+    fn check(resp: reqwest::blocking::Response) -> Result<serde_json::Value> {
+        let status = resp.status();
+        let body = resp.text()?;
+        if !status.is_success() {
+            anyhow::bail!("server {} : {body}", status);
+        }
+        Ok(serde_json::from_str(&body).unwrap_or(serde_json::Value::Null))
+    }
+
+    fn add(&self, text: &str, source_path: &str, meta: serde_json::Map<String, serde_json::Value>) -> Result<serde_json::Value> {
+        Self::check(self.req(reqwest::Method::POST, "/documents")
+            .json(&serde_json::json!({"text": text, "source_path": source_path, "meta": meta}))
+            .send()?)
+    }
+
+    fn query(&self, endpoint: &str, body: serde_json::Value) -> Result<Vec<serde_json::Value>> {
+        let v = Self::check(self.req(reqwest::Method::POST, endpoint).json(&body).send()?)?;
+        Ok(v.get("documents")
+            .and_then(|d| d.as_array())
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    fn delete(&self, id: &str) -> Result<()> {
+        let resp = self.req(reqwest::Method::POST, "/documents/delete")
+            .json(&serde_json::json!({"id": id}))
+            .send()?;
+        let status = resp.status();
+        let body = resp.text()?;
+        if status == reqwest::StatusCode::NOT_FOUND {
+            anyhow::bail!("document not found: {id}");
+        }
+        if !status.is_success() {
+            anyhow::bail!("server {status} : {body}");
+        }
+        Ok(())
+    }
+
+    fn stats(&self) -> Result<serde_json::Value> {
+        Self::check(self.req(reqwest::Method::GET, "/stats").send()?)
+    }
+}
+
 #[derive(Subcommand)]
 enum Cmd {
     /// Initialize a database from a schema config
@@ -41,7 +112,13 @@ enum Cmd {
     /// Add a document
     Add {
         #[arg(short, long)]
-        db: String,
+        db: Option<String>,
+        /// Connect to a running semdoc-server instead of the local db
+        #[arg(long)]
+        server: Option<String>,
+        /// Bearer token for --server (default: $SEMDOC_TOKEN)
+        #[arg(long)]
+        token: Option<String>,
         /// File to add (markdown/plain text)
         #[arg(short, long)]
         file: Option<String>,
@@ -58,7 +135,13 @@ enum Cmd {
     /// Query
     Query {
         #[arg(short, long)]
-        db: String,
+        db: Option<String>,
+        /// Connect to a running semdoc-server instead of the local db
+        #[arg(long)]
+        server: Option<String>,
+        /// Bearer token for --server (default: $SEMDOC_TOKEN)
+        #[arg(long)]
+        token: Option<String>,
         /// Query text
         #[arg(short = 't', long)]
         text: String,
@@ -71,14 +154,20 @@ enum Cmd {
         /// Filter JSON (Mongo-style: {"category":"a","score":{"$gte":3}})
         #[arg(long)]
         filter: Option<String>,
-        /// Filter as raw SQL (trusted input only)
+        /// Filter as raw SQL (trusted input only; local db only)
         #[arg(long)]
         filter_sql: Option<String>,
     },
     /// Delete a document (cascades: parent + leaf chunks + lightrag mirror)
     Delete {
         #[arg(short, long)]
-        db: String,
+        db: Option<String>,
+        /// Connect to a running semdoc-server instead of the local db
+        #[arg(long)]
+        server: Option<String>,
+        /// Bearer token for --server (default: $SEMDOC_TOKEN)
+        #[arg(long)]
+        token: Option<String>,
         /// Document id (parent or leaf chunk; a chunk id deletes its parent)
         #[arg(short, long)]
         id: String,
@@ -89,7 +178,13 @@ enum Cmd {
     /// Show database stats
     Stats {
         #[arg(short, long)]
-        db: String,
+        db: Option<String>,
+        /// Connect to a running semdoc-server instead of the local db
+        #[arg(long)]
+        server: Option<String>,
+        /// Bearer token for --server (default: $SEMDOC_TOKEN)
+        #[arg(long)]
+        token: Option<String>,
     },
 }
 
@@ -126,10 +221,10 @@ async fn main() -> Result<()> {
     DEPLOY.set(deploy).ok();
     match args.cmd {
         Cmd::Init { schema, db } => init(schema, db).await,
-        Cmd::Add { db, file, text, source, metas } => add(db, file, text, source, metas).await,
-        Cmd::Query { db, text, mode, limit, filter, filter_sql } => query(db, text, mode, limit, filter, filter_sql).await,
-        Cmd::Delete { db, id, force } => delete(db, id, force).await,
-        Cmd::Stats { db } => stats(db).await,
+        Cmd::Add { db, server, token, file, text, source, metas } => add(db, server, token, file, text, source, metas).await,
+        Cmd::Query { db, server, token, text, mode, limit, filter, filter_sql } => query(db, server, token, text, mode, limit, filter, filter_sql).await,
+        Cmd::Delete { db, server, token, id, force } => delete(db, server, token, id, force).await,
+        Cmd::Stats { db, server, token } => stats(db, server, token).await,
     }
 }
 
@@ -226,7 +321,31 @@ fn parse_metas(metas: &[String], config: &SchemaConfig) -> Result<serde_json::Ma
     Ok(extra)
 }
 
-async fn add(db: String, file: Option<String>, text: Option<String>, source: String, metas: Vec<String>) -> Result<()> {
+async fn add(
+    db: Option<String>,
+    server: Option<String>,
+    token: Option<String>,
+    file: Option<String>,
+    text: Option<String>,
+    source: String,
+    metas: Vec<String>,
+) -> Result<()> {
+    if let Some(url) = server {
+        let remote = Remote::new(&url, token.or_else(|| std::env::var("SEMDOC_TOKEN").ok()))?;
+        let text = match (file, text) {
+            (Some(f), _) => std::fs::read_to_string(&f)?,
+            (None, Some(t)) => t,
+            _ => anyhow::bail!("--file or --text required"),
+        };
+        let meta: serde_json::Map<String, serde_json::Value> = metas
+            .iter()
+            .filter_map(|m| m.split_once('=').map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string()))))
+            .collect();
+        remote.add(&text, &source, meta)?;
+        println!("added (id auto-hashed from content)");
+        return Ok(());
+    }
+    let db = db.expect("clap: db or server required");
     let (store, config) = open_store(&db).await?;
     let text = match (file, text) {
         (Some(f), _) => std::fs::read_to_string(&f)?,
@@ -319,7 +438,20 @@ pub async fn replace_old_versions(
     Ok(replaced)
 }
 
-async fn delete(db: String, id: String, force: bool) -> Result<()> {
+async fn delete(
+    db: Option<String>,
+    server: Option<String>,
+    token: Option<String>,
+    id: String,
+    force: bool,
+) -> Result<()> {
+    if let Some(url) = server {
+        let remote = Remote::new(&url, token.or_else(|| std::env::var("SEMDOC_TOKEN").ok()))?;
+        remote.delete(&id)?;
+        println!("deleted {id}");
+        return Ok(());
+    }
+    let db = db.expect("clap: db or server required");
     let (store, config) = open_store(&db).await?;
     if id.is_empty() {
         anyhow::bail!("--id is required");
@@ -459,14 +591,50 @@ pub async fn write_doc(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn query(
-    db: String,
+    db: Option<String>,
+    server: Option<String>,
+    token: Option<String>,
     text: String,
     mode: String,
     limit: usize,
     filter: Option<String>,
     filter_sql: Option<String>,
 ) -> Result<()> {
+    // Remote: Mongo-style filter JSON is sent as-is (server compiles it
+    // against the db schema). Raw SQL never crosses the network.
+    if let Some(url) = server {
+        if filter_sql.is_some() {
+            anyhow::bail!("--filter_sql is not supported with --server (trusted-input only, local db)");
+        }
+        let remote = Remote::new(&url, token.or_else(|| std::env::var("SEMDOC_TOKEN").ok()))?;
+        let filter_json: Option<serde_json::Value> = filter
+            .as_ref()
+            .map(|f| serde_json::from_str(f))
+            .transpose()?;
+        let endpoint = match mode.as_str() {
+            "semantic" => "/query/semantic",
+            "parent" => "/query/semantic",
+            "fts" => "/query/text",
+            "rerank" => "/query/reranked",
+            other => anyhow::bail!("unknown mode `{other}` (semantic|parent|fts|rerank)"),
+        };
+        let mut body = serde_json::json!({"text": text, "limit": limit});
+        if let Some(f) = &filter_json {
+            body["filter"] = f.clone();
+        }
+        if mode == "parent" {
+            body["expand_to"] = serde_json::json!("parent");
+        }
+        let docs = remote.query(endpoint, body)?;
+        for r in &docs {
+            println!("{}", serde_json::to_string_pretty(r)?);
+            println!("---");
+        }
+        return Ok(());
+    }
+    let db = db.expect("clap: db or server required");
     let (store, config) = open_store(&db).await?;
     let embedder = semdoc::embedding::Embedder::load(&deploy().embedding)?;
     let reranker = match semdoc::reranker::Reranker::load(&deploy().rerank) {
@@ -505,7 +673,13 @@ async fn query(
     Ok(())
 }
 
-async fn stats(db: String) -> Result<()> {
+async fn stats(db: Option<String>, server: Option<String>, token: Option<String>) -> Result<()> {
+    if let Some(url) = server {
+        let remote = Remote::new(&url, token.or_else(|| std::env::var("SEMDOC_TOKEN").ok()))?;
+        println!("stats: {}", remote.stats()?);
+        return Ok(());
+    }
+    let db = db.expect("clap: db or server required");
     let (store, _config) = open_store(&db).await?;
     println!("rows: {}", store.count().await?);
     Ok(())
