@@ -877,6 +877,70 @@ size = 300
     }
 
     #[test]
+    fn webhook_enabled_filters_events() {
+        // no url → always off
+        let off = ServerConfig::default();
+        assert!(!off.webhook_enabled("add"));
+        // url without explicit list → all events on
+        let all = ServerConfig { webhook_url: Some("http://h/hook".into()), ..Default::default() };
+        assert!(all.webhook_enabled("add"));
+        assert!(all.webhook_enabled("delete"));
+        assert!(all.webhook_enabled("update"));
+        // explicit list → only listed events fire
+        let filtered = ServerConfig {
+            webhook_url: Some("http://h/hook".into()),
+            webhook_events: Some(vec!["add".into()]),
+            ..Default::default()
+        };
+        assert!(filtered.webhook_enabled("add"));
+        assert!(!filtered.webhook_enabled("delete"));
+        assert!(!filtered.webhook_enabled("update"));
+    }
+
+    #[test]
+    fn webhook_secret_reads_env_indirection() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("SEMDOC_TEST_HOOK_SECRET");
+        let cfg = ServerConfig {
+            webhook_secret_env: Some("SEMDOC_TEST_HOOK_SECRET".into()),
+            ..Default::default()
+        };
+        // unset → None
+        assert!(cfg.webhook_secret().is_none());
+        // empty string counts as unset
+        std::env::set_var("SEMDOC_TEST_HOOK_SECRET", "");
+        assert!(cfg.webhook_secret().is_none());
+        // set → value
+        std::env::set_var("SEMDOC_TEST_HOOK_SECRET", "s3cret");
+        assert_eq!(cfg.webhook_secret().as_deref(), Some("s3cret"));
+        std::env::remove_var("SEMDOC_TEST_HOOK_SECRET");
+    }
+
+    #[test]
+    fn tls_apply_env_exports_flags() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("SEMDOC_TLS_INSECURE");
+        std::env::remove_var("SEMDOC_CA_BUNDLE");
+        // defaults: nothing exported
+        TlsConfig::default().apply_env();
+        assert!(std::env::var("SEMDOC_TLS_INSECURE").is_err());
+        assert!(std::env::var("SEMDOC_CA_BUNDLE").is_err());
+        // insecure + ca_bundle → both exported
+        let cfg = TlsConfig {
+            insecure: true,
+            ca_bundle: Some("/etc/semdoc/ca.pem".into()),
+        };
+        cfg.apply_env();
+        assert_eq!(std::env::var("SEMDOC_TLS_INSECURE").as_deref(), Ok("1"));
+        assert_eq!(
+            std::env::var("SEMDOC_CA_BUNDLE").as_deref(),
+            Ok("/etc/semdoc/ca.pem")
+        );
+        std::env::remove_var("SEMDOC_TLS_INSECURE");
+        std::env::remove_var("SEMDOC_CA_BUNDLE");
+    }
+
+    #[test]
     fn apply_chunk_env_pushes_values() {
         with_clean_env(|| {
             let cfg = DeploymentConfig {
