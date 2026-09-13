@@ -8,6 +8,10 @@
   <a href="#filtering">Filtering</a>
 </p>
 
+<p align="center">
+  <img src="docs/demo.gif" alt="semdoc 30-second demo: template init, ingest, semantic + full-text search" width="100%">
+</p>
+
 **semdoc** is a vector knowledge base where the metadata schema is a
 configuration file, not a hardcoded struct. One `schema.toml` → one
 knowledge base; point it at a different schema and you have a different
