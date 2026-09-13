@@ -209,13 +209,13 @@ impl Server {
                 },
                 {
                     "name": "query_graph",
-                    "description": "图谱检索（lightrag 后端）。默认 answer=false：返回结构化图谱数据（实体/关系/来源 chunk）+ 由图谱 chunk 映射回本库的本地文档（快，无 LLM）。answer=true：返回 LLM 综合答案（慢，30-60s+，走 LLM）。图谱后端不可用时自动降级为语义检索（响应含 degraded:true）。",
+                    "description": "图谱检索（lightrag 后端）。默认 synthesize=false：返回结构化图谱数据（实体/关系/来源 chunk，即 lightrag /query/data 的原样输出）+ 由图谱 chunk 映射回本库的本地文档（快，~9s，无答案生成）。synthesize=true：让 LLM 基于图谱合成一段自然语言答案（慢，未缓存 27-60s，随答案长度增长；同问题重复查询命中 lightrag 缓存后 ~9s）。图谱后端不可用时自动降级为语义检索（响应含 degraded:true）。",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "text": { "type": "string", "description": "查询文本" },
                             "limit": { "type": "integer", "default": 10 },
-                            "answer": { "type": "boolean", "description": "false（默认）：结构化图谱数据 + 映射文档（快）；true：LLM 综合答案（慢）" },
+                            "synthesize": { "type": "boolean", "description": "false（默认）：返回结构化图谱数据 + 映射文档（快，agent 应自行解析 entities/relationships/documents）；true：额外调用 LLM 生成自然语言答案（慢 27-60s，适合人类直接阅读；重复问题命中缓存后 ~9s）" },
                             "chunk_top_k": { "type": "integer", "description": "图谱层：lightrag 召回的 chunk 数（默认 20），调小更快" },
                             "max_entity_tokens": { "type": "integer", "description": "图谱层：实体上下文 token 预算（默认 6000）" },
                             "max_relation_tokens": { "type": "integer", "description": "图谱层：关系上下文 token 预算（默认 8000）" },
@@ -227,13 +227,13 @@ impl Server {
                 },
                 {
                     "name": "query_hybrid",
-                    "description": "混合检索：语义（reranked）与图谱并行查询，按文档 id 合并去重——图谱结果在前（宏观关联），语义结果在后（佐证细节）。answer=true 时图谱侧返回 LLM 答案。适合需要'既有图谱多跳关系、又有原文依据'的问题。",
+                    "description": "混合检索：语义（reranked）与图谱并行查询，按文档 id 合并去重——图谱结果在前（宏观关联），语义结果在后（佐证细节）。synthesize=true 时图谱侧额外调用 LLM 生成自然语言答案（慢）。适合需要'既有图谱多跳关系、又有原文依据'的问题。",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "text": { "type": "string", "description": "查询文本" },
                             "limit": { "type": "integer", "default": 10 },
-                            "answer": { "type": "boolean", "description": "图谱侧：false（默认）=结构化图谱数据；true=LLM 综合答案" },
+                            "synthesize": { "type": "boolean", "description": "图谱侧：false（默认）=结构化图谱数据（快）；true=LLM 综合答案（慢 27-60s）" },
                             "chunk_top_k": { "type": "integer", "description": "图谱层：lightrag 召回 chunk 数（默认 20）" },
                             "max_entity_tokens": { "type": "integer", "description": "图谱层：实体 token 预算（默认 6000）" },
                             "max_relation_tokens": { "type": "integer", "description": "图谱层：关系 token 预算（默认 8000）" },
@@ -844,7 +844,7 @@ async fn query_graph_via_plugin(
     args: &Value,
 ) -> Value {
     use crate::plugins::graph::{GraphMode, GraphQueryParams};
-    let want_answer = args.get("answer").and_then(|v| v.as_bool()).unwrap_or(false);
+    let want_answer = args.get("synthesize").and_then(|v| v.as_bool()).unwrap_or(false);
     let mode = if want_answer { GraphMode::Hybrid } else { GraphMode::Data };
     let n = |k: &str| args.get(k).and_then(|v| v.as_u64()).map(|v| v as usize);
     let params = GraphQueryParams {
@@ -860,13 +860,21 @@ async fn query_graph_via_plugin(
                 Ok(docs) => {
                     let vals: Vec<Value> = docs.iter().map(record_json).collect();
                     json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&json!({
-                        "degraded": true, "answer": Value::Null, "graph": Value::Null, "documents": vals,
+                        "degraded": true, "synthesized": Value::Null, "graph": Value::Null, "documents": vals,
                     })).unwrap_or_default() }] })
                 }
                 Err(e) => err(format!("query failed: {e:#}")),
             }
         }
-        Ok(answer) if want_answer => json!({ "content": [{ "type": "text", "text": answer.content }] }),
+        Ok(answer) if want_answer => {
+            // lightrag /query wraps the answer in {"response": "..."} — unwrap
+            // so the agent gets the plain synthesized text.
+            let text = serde_json::from_str::<Value>(&answer.content)
+                .ok()
+                .and_then(|v| v.get("response").and_then(|r| r.as_str()).map(String::from))
+                .unwrap_or(answer.content);
+            json!({ "content": [{ "type": "text", "text": text }] })
+        }
         Ok(answer) => {
             // Data mode: structured envelope + mapped local documents.
             let raw: Value = match serde_json::from_str(&answer.content) {
@@ -949,7 +957,7 @@ async fn query_hybrid_via_plugin(
     args: &Value,
 ) -> Value {
     use crate::plugins::graph::{GraphMode, GraphQueryParams};
-    let want_answer = args.get("answer").and_then(|v| v.as_bool()).unwrap_or(false);
+    let want_answer = args.get("synthesize").and_then(|v| v.as_bool()).unwrap_or(false);
     let mode = if want_answer { GraphMode::Hybrid } else { GraphMode::Data };
     let n = |k: &str| args.get(k).and_then(|v| v.as_u64()).map(|v| v as usize);
     let params = GraphQueryParams {
@@ -966,7 +974,7 @@ async fn query_hybrid_via_plugin(
     let mut merged: Vec<Value> = Vec::new();
     let mut degraded = false;
     let mut seen = std::collections::HashSet::new();
-    let mut answer_json = Value::Null;
+    let mut synthesized = Value::Null;
 
     match graph_res {
         Err(e) => {
@@ -974,8 +982,8 @@ async fn query_hybrid_via_plugin(
             degraded = true;
         }
         Ok(a) if want_answer => {
-            answer_json = Value::String(a.content);
-            merged.push(json!({ "answer": answer_json }));
+            synthesized = Value::String(a.content);
+            merged.push(json!({ "synthesized": synthesized }));
         }
         Ok(a) => {
             if let Ok(raw) = serde_json::from_str::<Value>(&a.content) {
@@ -1049,7 +1057,7 @@ async fn query_hybrid_via_plugin(
     }
 
     json!({ "content": [{ "type": "text", "text": serde_json::to_string_pretty(&json!({
-        "degraded": degraded, "answer": answer_json, "documents": merged,
+        "degraded": degraded, "synthesized": synthesized, "documents": merged,
     })).unwrap_or_default() }] })
 }
 
