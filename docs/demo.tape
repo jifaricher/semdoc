@@ -6,7 +6,7 @@ Set Height 620
 Set Theme { "background": "#14141f", "foreground": "#e8e8f0", "cursor": "#9ad", "black": "#14141f", "green": "#7fd88f", "yellow": "#f5d76e", "blue": "#6fb3ff", "magenta": "#c792ea", "cyan": "#7fdbff" }
 Set Padding 24
 Set Shell bash
-Type "export SEMDOC_CONFIG=/home/vhsuser/demo-work/vhs_config.toml"
+Type "export SEMDOC_CONFIG=/home/vhsuser/demo-work/vhs_config.toml RUST_LOG=off"
 Enter
 Sleep 200ms
 Type "semdoc init --template code-search --db ./demo && echo '--- template ready ---'"
