@@ -536,6 +536,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "onnx")] // validates the onnx backend path
     fn parse_onnx_and_none_backends() {
         // NOTE: apply_env_overrides() downgrades a file-specified
         // `backend = "onnx"` to default http unless SEMDOC_EMBEDDER_DIR is
