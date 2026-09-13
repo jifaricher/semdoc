@@ -1,12 +1,13 @@
 [package]
 name = "semdocs"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Config-schema-driven vector knowledge base: LanceDB storage, pluggable embedding/reranker/graph backends, CLI + HTTP REST + MCP (stdio & streamable HTTP)"
 keywords = ["rag", "vector-database", "embeddings", "mcp", "knowledge-base"]
 categories = ["database-implementations", "science", "text-processing", "command-line-utilities"]
 repository = "https://github.com/jifaricher/semdoc"
+homepage = "https://github.com/jifaricher/semdoc"
 readme = "README.md"
 
 [dependencies]
