@@ -31,10 +31,10 @@ use axum::{
     Json, Router,
 };
 use clap::Parser;
-use semdoc::mcp::Server as McpServer;
-use semdoc::plugins::graph::GraphMode;
-use semdoc::query::{record_json, ExpandTo};
-use semdoc::store::InputDoc;
+use semdocs::mcp::Server as McpServer;
+use semdocs::plugins::graph::GraphMode;
+use semdocs::query::{record_json, ExpandTo};
+use semdocs::store::InputDoc;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -128,7 +128,7 @@ fn auth_ok(state: &AppState, headers: &HeaderMap) -> bool {
 fn filter_sql(state: &AppState, body: &QueryBody) -> Result<Option<String>, String> {
     match &body.filter {
         Some(f) if f.as_object().is_some_and(|o| !o.is_empty()) => {
-            let pred = semdoc::query::Pred::from_json(f).map_err(|e| e.to_string())?;
+            let pred = semdocs::query::Pred::from_json(f).map_err(|e| e.to_string())?;
             pred.compile(&state.mcp.engine.config).map(Some).map_err(|e| e.to_string())
         }
         _ => Ok(None),
@@ -140,9 +140,9 @@ async fn main() -> Result<()> {
     let args = Args::parse();
     // One Server (engine + graph) backs both the REST handlers and /mcp.
     let mcp = McpServer::new(&args.db, args.rerank, args.config.as_deref()).await?;
-    let deploy = semdoc::config::DeploymentConfig::load(args.config.as_deref())?;
+    let deploy = semdocs::config::DeploymentConfig::load(args.config.as_deref())?;
     deploy.apply_chunk_env();
-    semdoc::mcp::register_webhooks(deploy.server.clone());
+    semdocs::mcp::register_webhooks(deploy.server.clone());
     let token = deploy
         .server_token()
         .or_else(|| std::env::var("SEMDOC_TOKEN").ok());
@@ -232,7 +232,7 @@ async fn add_doc(
     semdoc_bin_helpers::write_doc(&state.mcp.engine.store, &state.mcp.engine.embedder, doc)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-    semdoc::mcp::fire_event(
+    semdocs::mcp::fire_event(
         "add",
         &blake3::hash(body.text.as_bytes()).to_hex(),
         json!({ "via": "rest" }),
@@ -255,7 +255,7 @@ async fn delete_doc(
     if !auth_ok(&state, &headers) {
         return Err((StatusCode::UNAUTHORIZED, "unauthorized".into()));
     }
-    match semdoc::mcp::delete_doc_checked(&state.mcp, &body.id).await {
+    match semdocs::mcp::delete_doc_checked(&state.mcp, &body.id).await {
         Ok(_msg) => Ok(Json(json!({"ok": true}))),
         Err(e) => {
             let msg = format!("{e:#}");
@@ -313,7 +313,7 @@ async fn query_semantic(
     let expand_to = body.expand_to.as_deref().map(ExpandTo::parse).unwrap_or(ExpandTo::Chunk);
     let docs = state
         .mcp.engine
-        .query_semantic(&body.text, body.limit.unwrap_or(10).min(semdoc::query::MAX_LIMIT), sql.as_deref(), expand_to)
+        .query_semantic(&body.text, body.limit.unwrap_or(10).min(semdocs::query::MAX_LIMIT), sql.as_deref(), expand_to)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok(Json(json!({ "documents": docs.iter().map(record_json).collect::<Vec<_>>() })))
@@ -330,7 +330,7 @@ async fn query_text(
     let sql = filter_sql(&state, &body).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let docs = state
         .mcp.engine
-        .query_fts(&body.text, body.limit.unwrap_or(10).min(semdoc::query::MAX_LIMIT), sql.as_deref())
+        .query_fts(&body.text, body.limit.unwrap_or(10).min(semdocs::query::MAX_LIMIT), sql.as_deref())
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok(Json(json!({ "documents": docs.iter().map(record_json).collect::<Vec<_>>() })))
@@ -347,7 +347,7 @@ async fn query_reranked(
     let sql = filter_sql(&state, &body).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let docs = state
         .mcp.engine
-        .query_reranked(&body.text, body.limit.unwrap_or(10).min(semdoc::query::MAX_LIMIT), sql.as_deref(), body.recall_k)
+        .query_reranked(&body.text, body.limit.unwrap_or(10).min(semdocs::query::MAX_LIMIT), sql.as_deref(), body.recall_k)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok(Json(json!({ "documents": docs.iter().map(record_json).collect::<Vec<_>>() })))
@@ -361,7 +361,7 @@ async fn query_graph(
     if !auth_ok(&state, &headers) {
         return Err((StatusCode::UNAUTHORIZED, "unauthorized".into()));
     }
-    let limit = body.limit.unwrap_or(10).min(semdoc::query::MAX_LIMIT);
+    let limit = body.limit.unwrap_or(10).min(semdocs::query::MAX_LIMIT);
     let want_answer = body.synthesize.unwrap_or(false);
     // Filter is validated (compile errors surface as 400) but graph queries
     // don't consume SQL — the graph backend has its own metadata filtering.
@@ -420,7 +420,7 @@ async fn query_graph(
             for id in &chunk_doc_ids {
                 if let Some(p) = parents.get(id) {
                     if let Some(fj) = &body.filter {
-                        if let Ok(pred) = semdoc::query::Pred::from_json(fj) {
+                        if let Ok(pred) = semdocs::query::Pred::from_json(fj) {
                             if !pred_matches(&pred, p) {
                                 continue;
                             }
@@ -461,7 +461,7 @@ async fn query_graph(
                     }
                     if contents.iter().any(|c| p.raw_text.contains(c.as_str())) {
                         if let Some(fj) = &body.filter {
-                            if let Ok(pred) = semdoc::query::Pred::from_json(fj) {
+                            if let Ok(pred) = semdocs::query::Pred::from_json(fj) {
                                 if !pred_matches(&pred, p) {
                                     continue;
                                 }
@@ -498,7 +498,7 @@ async fn query_hybrid(
     if !auth_ok(&state, &headers) {
         return Err((StatusCode::UNAUTHORIZED, "unauthorized".into()));
     }
-    let limit = body.limit.unwrap_or(10).min(semdoc::query::MAX_LIMIT);
+    let limit = body.limit.unwrap_or(10).min(semdocs::query::MAX_LIMIT);
     let sql = filter_sql(&state, &body).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let params = graph_params(&body);
     let want_answer = body.synthesize.unwrap_or(false);
@@ -641,8 +641,8 @@ async fn stats(
     Ok(Json(json!({"rows": rows})))
 }
 
-fn graph_params(body: &QueryBody) -> semdoc::plugins::graph::GraphQueryParams {
-    semdoc::plugins::graph::GraphQueryParams {
+fn graph_params(body: &QueryBody) -> semdocs::plugins::graph::GraphQueryParams {
+    semdocs::plugins::graph::GraphQueryParams {
         chunk_top_k: body.chunk_top_k,
         max_entity_tokens: body.max_entity_tokens,
         max_relation_tokens: body.max_relation_tokens,
@@ -652,8 +652,8 @@ fn graph_params(body: &QueryBody) -> semdoc::plugins::graph::GraphQueryParams {
 
 /// In-memory predicate evaluation for the graph-data document mapping path
 /// (the SQL path can't apply — mapping happens after the ANN/FTS engine).
-fn pred_matches(pred: &semdoc::query::Pred, rec: &semdoc::store::Record) -> bool {
-    use semdoc::query::Pred;
+fn pred_matches(pred: &semdocs::query::Pred, rec: &semdocs::store::Record) -> bool {
+    use semdocs::query::Pred;
     match pred {
         Pred::And(ps) => ps.iter().all(|p| pred_matches(p, rec)),
         Pred::Or(ps) => ps.iter().any(|p| pred_matches(p, rec)),
@@ -701,7 +701,7 @@ fn pred_matches(pred: &semdoc::query::Pred, rec: &semdoc::store::Record) -> bool
 
 const RESERVED_FILTERABLE_MEME: &[&str] = &["source_path", "source_type"];
 
-fn field_value(rec: &semdoc::store::Record, name: &str) -> Value {
+fn field_value(rec: &semdocs::store::Record, name: &str) -> Value {
     match name {
         "source_path" => Value::String(rec.source_path.clone()),
         "source_type" => Value::String(rec.source_type.clone()),
@@ -723,8 +723,8 @@ fn json_eq(a: &Value, b: &Value) -> bool {
 /// the same store calls).
 mod semdoc_bin_helpers {
     use anyhow::Result;
-    use semdoc::embedding::Embedder;
-    use semdoc::store::{InputDoc, Record, Store};
+    use semdocs::embedding::Embedder;
+    use semdocs::store::{InputDoc, Record, Store};
     use std::collections::HashMap;
 
     pub async fn write_doc(
@@ -736,7 +736,7 @@ mod semdoc_bin_helpers {
         let language = doc.language.clone();
         let source_path = doc.source_path.clone();
         let leaves_src =
-            semdoc::chunker::chunk_for(&doc.raw_text, &doc_id, language.as_deref(), &source_path);
+            semdocs::chunker::chunk_for(&doc.raw_text, &doc_id, language.as_deref(), &source_path);
 
         let mut parent_vectors: HashMap<String, Vec<f32>> = HashMap::new();
         let mut leaf_vector_lists: HashMap<String, Vec<Vec<f32>>> = HashMap::new();
@@ -892,7 +892,7 @@ async fn ui_index(
     let filter_sql = if filter_obj.is_empty() {
         None
     } else {
-        let pred = semdoc::query::Pred::from_json(&Value::Object(filter_obj)).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        let pred = semdocs::query::Pred::from_json(&Value::Object(filter_obj)).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
         Some(pred.compile(&state.mcp.engine.config).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?)
     };
 
@@ -1043,7 +1043,7 @@ async fn ui_search(
         return Ok(axum::response::Html(ui_page("Search", &body)));
     }
 
-    let render_hits = |title: &str, docs: &[semdoc::store::Record]| -> String {
+    let render_hits = |title: &str, docs: &[semdocs::store::Record]| -> String {
         let mut s = format!("<h2>{title}</h2>");
         if docs.is_empty() {
             s.push_str("<p style=\"color:#888\">no results</p>");
@@ -1363,7 +1363,7 @@ async fn mcp_post(
 
     let result = match method {
         "initialize" | "notifications/initialized" | "tools/list" | "tools/call" => {
-            semdoc::mcp::handle_request(&state.mcp, method, &params).await
+            semdocs::mcp::handle_request(&state.mcp, method, &params).await
         }
         other => json!({
             "error": { "code": -32601, "message": format!("method not found: {other}") }
