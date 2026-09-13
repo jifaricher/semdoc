@@ -1,0 +1,76 @@
+# lightrag-server 运行配置 — 仅供 scripts/start-lightrag-server.sh 读取
+#
+# 与 Config.toml（部署事实）和 schema.toml（库 schema）完全解耦：
+#   - Config.toml / schema.toml 描述 semdoc 侧（embedder、chunk、表结构、插件 endpoint）
+#   - 本文件描述 lightrag-server 进程自身怎么起（存储后端、LLM/Embedding/Rerank 绑定、监听地址）
+#
+# 语法约束（bash 手写解析器，非完整 TOML）：仅支持扁平的 `key = "value"` /
+# `key = 123` / `key = true`，不支持嵌套表、数组、多行字符串、注释尾随。
+# 任何 key 都可以省略，省略时使用 lightrag-server 内置默认值。
+
+# ---------------------------------------------------------------------------
+# server 进程
+# ---------------------------------------------------------------------------
+host = "0.0.0.0"
+port = 9621
+log_level = "INFO"
+# 进程内文档摄取并发（LLM 实体抽取是瓶颈）
+max_parallel_insert = 3
+max_async = 8
+
+# 多实例隔离：lightrag 所有存储表/图都按这个 workspace 前缀隔离。
+# semdoc 的 [plugins.graph] 只指向 endpoint，workspace 由本文件决定。
+workspace = "semdoc_kernel"
+
+# API Key（Basic Auth）。留空则不启用认证；也可以用环境变量 LIGHTRAG_API_KEY。
+# lightrag_api_key = ""
+
+# ---------------------------------------------------------------------------
+# 存储后端（全部走 Postgres + Neo4j，与 semdoc 的 LanceDB 互相独立）
+# ---------------------------------------------------------------------------
+kv_storage = "PGKVStorage"
+vector_storage = "PGVectorStorage"
+graph_storage = "Neo4JStorage"
+doc_status_storage = "PGDocStatusStorage"
+
+postgres_host = "localhost"
+postgres_port = 5455
+postgres_user = "rag"
+# 密钥两种写法（二选一，env 优先）：
+#   a) postgres_password_env = "环境变量名"   ← 推荐，密钥不落盘
+#   b) postgres_password = "值"              ← 内联，单机/内网部署方便；勿提交 git
+postgres_password_env = "LIGHTRAG_PG_PASSWORD"
+postgres_database = "rag"
+postgres_vector_index_type = "HNSW"
+postgres_hnsw_m = 16
+postgres_hnsw_ef = 200
+
+neo4j_uri = "neo4j://localhost:7687"
+neo4j_username = "neo4j"
+neo4j_password_env = "LIGHTRAG_NEO4J_PASSWORD"   # 或直接 neo4j_password = "..."
+neo4j_database = "neo4j"
+
+# ---------------------------------------------------------------------------
+# LLM 绑定（实体/关系抽取 + hybrid 答案生成）
+# ---------------------------------------------------------------------------
+llm_binding = "openai"
+llm_binding_host = "http://120.79.51.151:13825/v1"
+llm_model = "auto"
+llm_binding_api_key_env = "LIGHTRAG_LLM_API_KEY"   # 或直接 llm_binding_api_key = "..."
+
+# ---------------------------------------------------------------------------
+# Embedding 绑定（必须与 semdoc 的 [embedding] 同一模型，否则图谱/语义空间错位）
+# ---------------------------------------------------------------------------
+embedding_binding = "ollama"
+embedding_binding_host = "http://192.168.1.7:11434"
+embedding_model = "bge-m3"
+embedding_dim = 1024
+embedding_binding_api_key_env = "LIGHTRAG_EMBEDDING_API_KEY"   # 或直接 embedding_binding_api_key = "..."
+
+# ---------------------------------------------------------------------------
+# Rerank 绑定（mix 模式查询时重排）
+# ---------------------------------------------------------------------------
+rerank_binding = "cohere"
+rerank_model = "BAAI/bge-reranker-v2-m3"
+rerank_binding_host = "http://192.168.1.7:8000/rerank"
+rerank_binding_api_key_env = "LIGHTRAG_RERANK_API_KEY"   # 或直接 rerank_binding_api_key = "..."

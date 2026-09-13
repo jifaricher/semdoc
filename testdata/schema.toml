@@ -1,0 +1,28 @@
+# Schema for real-data E2E test — mirrors the semrag kernel-doc use case
+# while exercising the configurable-schema features.
+
+[table]
+name = "documents"
+
+[vector]
+fields = [
+  { name = "dense_vec", dim = 1024, source = "raw_text", metric = "cosine", index = "none" },
+]
+
+[fields]
+domain    = { type = "string", index = true }   # e.g. sched / mm / net
+topic     = { type = "string", index = true }   # e.g. mixed_qos / smt_expulsion
+priority  = { type = "int64",  index = true }
+verified  = { type = "bool" }
+keywords  = { type = "list<string>" }
+
+[plugins.graph]
+backend = "lightrag-server"
+endpoint = "http://127.0.0.1:9621"
+query_timeout_secs = 60
+insert_concurrency = 2
+
+[plugins.rerank]
+backend = "tei"
+endpoint = "http://192.168.1.7:8000"
+api_key_env = "TEST_RERANKER_KEY"

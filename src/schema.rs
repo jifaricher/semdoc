@@ -1,0 +1,632 @@
+//! Schema configuration: `[table]`, `[vector]`, `[fields]`, `[plugins]`.
+//!
+//! One schema file describes one database. The parsed `SchemaConfig` is the
+//! single source of truth from which the Arrow schema, the filter compiler,
+//! the MCP tool schemas and the plugin set are all derived.
+
+use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::path::Path;
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct SchemaConfig {
+    #[serde(default)]
+    pub table: TableConfig,
+    #[serde(default)]
+    pub vector: VectorConfig,
+    #[serde(default)]
+    pub fields: BTreeMap<String, FieldConfig>,
+    #[serde(default)]
+    pub plugins: PluginsConfig,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct TableConfig {
+    /// LanceDB table name. Reserved: one table per database.
+    #[serde(default = "default_table_name")]
+    pub name: String,
+}
+
+impl Default for TableConfig {
+    fn default() -> Self {
+        TableConfig { name: default_table_name() }
+    }
+}
+
+fn default_table_name() -> String {
+    "documents".to_string()
+}
+
+/// Vector column definition. A vector field is *derived*: `source` names the
+/// text field whose content is embedded into this column at write time.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct VectorFieldConfig {
+    pub name: String,
+    pub dim: usize,
+    /// Which text field the embedding is derived from. Must reference a
+    /// reserved text field (`raw_text`) or a user field of type `text`.
+    pub source: String,
+    #[serde(default = "default_metric")]
+    pub metric: String, // cosine | l2 | dot
+    /// `none` (brute force — right for small/medium KBs), `ivf_pq`, `ivf_flat`.
+    #[serde(default = "default_vector_index")]
+    pub index: String,
+    /// Auto-embed on write using the default embedder. When false, only
+    /// client-pre-embedded writes are accepted for this column.
+    #[serde(default = "default_true")]
+    pub auto_embed: bool,
+}
+
+fn default_metric() -> String {
+    "cosine".to_string()
+}
+fn default_vector_index() -> String {
+    "none".to_string()
+}
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct VectorConfig {
+    /// Empty means "derive one vector field from raw_text using the default
+    /// embedder's dimension" — resolved at init time into a single field
+    /// named `dense_vec`.
+    #[serde(default)]
+    pub fields: Vec<VectorFieldConfig>,
+}
+
+/// User-defined scalar field.
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct FieldConfig {
+    /// string | text | bool | int64 | float32 | timestamp | list<string>
+    ///
+    /// `string` is short, filterable metadata. `text` is long-form prose
+    /// (searchable via FTS, usable as a vector `source`). `string` fields are
+    /// NOT FTS-searchable; `text` fields are not directly filterable with
+    /// equality (use FTS).
+    pub r#type: String,
+    /// Build a BTree scalar index for fast `only_if` pre-filtering.
+    #[serde(default)]
+    pub index: bool,
+    /// Reject writes missing this field.
+    #[serde(default)]
+    pub required: bool,
+    /// Replacement key: when `add` writes a document whose values for ALL
+    /// `replace_key = true` fields match an existing parent row, that row
+    /// (and its leaf chunks, and the lightrag mirror) is deleted first —
+    /// "upsert by business identity" instead of append. Multiple keys are
+    /// AND-ed; every key must be a string field. Example:
+    /// `source_path = { type = "string", index = true, replace_key = true }`.
+    #[serde(default)]
+    pub replace_key: bool,
+}
+
+impl FieldConfig {
+    pub fn new(t: &str) -> Self {
+        FieldConfig { r#type: t.to_string(), index: false, required: false, replace_key: false }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+pub struct PluginsConfig {
+    #[serde(default)]
+    pub graph: Option<GraphPluginConfig>,
+    #[serde(default)]
+    pub rerank: Option<RerankPluginConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+#[serde(tag = "backend")]
+pub enum GraphPluginConfig {
+    /// LightRAG server over HTTP — zero Python in the semdoc process.
+    LightragServer {
+        endpoint: String,
+        #[serde(default)]
+        api_key_env: Option<String>,
+        #[serde(default = "default_query_timeout")]
+        query_timeout_secs: u64,
+        #[serde(default = "default_insert_concurrency")]
+        insert_concurrency: usize,
+        /// Background ainsert timeout (entity extraction is LLM-bound and
+        /// slow; defaults generous like semrag's 1h).
+        #[serde(default = "default_insert_timeout")]
+        insert_timeout_secs: u64,
+        #[serde(default = "default_delete_timeout")]
+        delete_timeout_secs: u64,
+    },
+    /// In-process PyO3 lightrag (feature `lightrag-embedded`).
+    LightragEmbedded {
+        #[serde(default)]
+        workspace: Option<String>,
+        #[serde(default = "default_query_timeout")]
+        query_timeout_secs: u64,
+    },
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+#[serde(tag = "backend")]
+pub enum RerankPluginConfig {
+    /// In-process INT8 ONNX cross-encoder (feature `onnx`).
+    Onnx {
+        #[serde(default)]
+        dir: Option<String>,
+    },
+    /// TEI-compatible `/rerank` endpoint.
+    Tei {
+        endpoint: String,
+        #[serde(default)]
+        api_key_env: Option<String>,
+        #[serde(default = "default_query_timeout")]
+        timeout_secs: u64,
+    },
+    /// OpenAI-compatible `/v1/rerank` (base URL up to and including `/v1`).
+    Openai {
+        endpoint: String,
+        #[serde(default)]
+        api_key_env: Option<String>,
+        #[serde(default)]
+        model: Option<String>,
+        #[serde(default = "default_query_timeout")]
+        timeout_secs: u64,
+    },
+}
+
+fn default_query_timeout() -> u64 {
+    60
+}
+fn default_insert_timeout() -> u64 {
+    600
+}
+fn default_delete_timeout() -> u64 {
+    120
+}
+fn default_insert_concurrency() -> usize {
+    4
+}
+
+/// Pipeline-reserved columns present in every database. These implement the
+/// retrieval mechanism itself (chunk hierarchy, dedup, expansion) and cannot
+/// be declared or overridden in `[fields]`.
+pub const RESERVED_COLUMNS: &[&str] = &[
+    "id",
+    "raw_text",
+    "chunk_level",
+    "chunk_index",
+    "parent_doc_id",
+];
+
+impl SchemaConfig {
+    pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("read schema {}: {e}", path.display()))?;
+        let config: SchemaConfig = toml::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("parse schema {}: {e}", path.display()))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        use std::collections::HashSet;
+
+        // Vector fields: unique names, valid metric/index, resolvable source.
+        let mut vec_names = HashSet::new();
+        for v in &self.vector.fields {
+            if !vec_names.insert(v.name.as_str()) {
+                anyhow::bail!("duplicate vector field name: {}", v.name);
+            }
+            if RESERVED_COLUMNS.contains(&v.name.as_str()) {
+                anyhow::bail!("vector field name `{}` collides with a reserved column", v.name);
+            }
+            if self.fields.contains_key(&v.name) {
+                anyhow::bail!("vector field `{}` collides with a [fields] entry", v.name);
+            }
+            match v.dim {
+                0 => anyhow::bail!("vector field `{}`: dim must be > 0", v.name),
+                d if d > 100_000 => anyhow::bail!("vector field `{}`: dim {d} unrealistic", v.name),
+                _ => {}
+            }
+            match v.metric.as_str() {
+                "cosine" | "l2" | "dot" => {}
+                other => anyhow::bail!(
+                    "vector field `{}`: unknown metric `{other}` (cosine|l2|dot)",
+                    v.name
+                ),
+            }
+            match v.index.as_str() {
+                "none" | "ivf_pq" | "ivf_flat" => {}
+                other => anyhow::bail!(
+                    "vector field `{}`: unknown index `{other}` (none|ivf_pq|ivf_flat)",
+                    v.name
+                ),
+            }
+            let source_ok = v.source == "raw_text"
+                || self
+                    .fields
+                    .get(&v.source)
+                    .is_some_and(|f| f.r#type == "text");
+            if !source_ok {
+                anyhow::bail!(
+                    "vector field `{}`: source `{}` must be `raw_text` or a [fields] entry of type `text`",
+                    v.name,
+                    v.source
+                );
+            }
+        }
+
+        // Scalar fields: known types, no reserved collisions.
+        for (name, f) in &self.fields {
+            if RESERVED_COLUMNS.contains(&name.as_str()) {
+                anyhow::bail!("field `{name}` collides with a reserved column");
+            }
+            match f.r#type.as_str() {
+                "string" | "text" | "bool" | "int64" | "float32" | "timestamp"
+                | "list<string>" => {}
+                other => anyhow::bail!(
+                    "field `{name}`: unknown type `{other}` \
+                     (string|text|bool|int64|float32|timestamp|list<string>)"
+                ),
+            }
+            if f.r#type == "text" && f.index {
+                anyhow::bail!(
+                    "field `{name}`: `text` fields are FTS-searched, not scalar-indexed \
+                     (drop `index = true`)"
+                );
+            }
+        }
+
+        // Rerank backend vs build features.
+        if let Some(r) = &self.plugins.rerank {
+            match r {
+                RerankPluginConfig::Onnx { .. } if !cfg!(feature = "onnx") => {
+                    anyhow::bail!("rerank backend `onnx` requires building with feature `onnx`");
+                }
+                _ => {}
+            }
+        }
+        if let Some(g) = &self.plugins.graph {
+            if matches!(g, GraphPluginConfig::LightragEmbedded { .. })
+                && !cfg!(feature = "lightrag-embedded")
+            {
+                anyhow::bail!(
+                    "graph backend `lightrag-embedded` requires building with feature `lightrag-embedded`"
+                );
+            }
+        }
+
+        // Replacement keys: every `replace_key = true` field must be a
+        // string. Multiple keys are AND-ed at replace time.
+        for (name, fc) in &self.fields {
+            if fc.replace_key && fc.r#type != "string" {
+                anyhow::bail!(
+                    "field `{name}`: replace_key requires type `string` (got `{}`)",
+                    fc.r#type
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Fields flagged as replacement keys, in declaration order. Empty when
+    /// the schema opts out of replace-on-add semantics.
+    pub fn replace_key_fields(&self) -> Vec<&str> {
+        self.fields
+            .iter()
+            .filter(|(_, fc)| fc.replace_key)
+            .map(|(name, _)| name.as_str())
+            .collect()
+    }
+
+    /// Compare this config against the physical field set a database was
+    /// created with (name -> type). Returns Err listing the differences.
+    /// `id`-level identity is not required — index flags and other metadata
+    /// may evolve — but the column set and types must match exactly.
+    pub fn check_compatible_with(
+        &self,
+        physical: &std::collections::BTreeMap<String, String>,
+    ) -> anyhow::Result<()> {
+        let mine: std::collections::BTreeMap<String, String> = self
+            .fields
+            .iter()
+            .map(|(k, v)| (k.clone(), v.r#type.clone()))
+            .collect();
+        let missing: Vec<&String> = physical.keys().filter(|k| !mine.contains_key(*k)).collect();
+        let extra: Vec<&String> = mine.keys().filter(|k| !physical.contains_key(*k)).collect();
+        let mut errs = Vec::new();
+        if !missing.is_empty() {
+            errs.push(format!(
+                "schema no longer declares column(s) present in the database: {}",
+                missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        if !extra.is_empty() {
+            errs.push(format!(
+                "schema declares column(s) absent from the database: {}",
+                extra.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+            ));
+        }
+        for (k, t) in &mine {
+            if let Some(pt) = physical.get(k) {
+                if pt != t {
+                    errs.push(format!("column `{k}` type changed: db has `{pt}`, schema says `{t}`"));
+                }
+            }
+        }
+        if errs.is_empty() {
+            Ok(())
+        } else {
+            anyhow::bail!("schema/database mismatch:\n  - {}", errs.join("\n  - "))
+        }
+    }
+
+    /// Parse a physical-fields TOML file (name = "type" lines) written by
+    /// `semdoc init`.
+    pub fn load_physical_fields(path: &std::path::Path) -> anyhow::Result<std::collections::BTreeMap<String, String>> {
+        let raw = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("read physical schema {}: {e}", path.display()))?;
+        let value: toml::Value = toml::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("parse physical schema {}: {e}", path.display()))?;
+        let mut out = std::collections::BTreeMap::new();
+        if let Some(fields) = value.get("fields").and_then(|f| f.as_table()) {
+            for (name, def) in fields {
+                let t = def
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("physical schema: field `{name}` missing type"))?;
+                out.insert(name.clone(), t.to_string());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Default single-vector field used when `[vector].fields` is empty:
+    /// one `dense_vec` column derived from `raw_text`. The dim is resolved
+    /// from the loaded embedder at init time (written back into the manifest).
+    pub fn effective_vector_fields(&self, default_dim: usize) -> Vec<VectorFieldConfig> {
+        if !self.vector.fields.is_empty() {
+            return self.vector.fields.clone();
+        }
+        vec![VectorFieldConfig {
+            name: "dense_vec".to_string(),
+            dim: default_dim,
+            source: "raw_text".to_string(),
+            metric: "cosine".to_string(),
+            index: "none".to_string(),
+            auto_embed: true,
+        }]
+    }
+
+    /// User-defined text fields (eligible FTS columns / vector sources).
+    pub fn text_fields(&self) -> Vec<&str> {
+        self.fields
+            .iter()
+            .filter(|(_, f)| f.r#type == "text")
+            .map(|(n, _)| n.as_str())
+            .collect()
+    }
+}
+
+/// Built-in starter schemas. Each template = one schema.toml; after init
+/// the caller adds documents through any interface. `generic` is default.
+pub fn template_schema_content(name: &str) -> anyhow::Result<&'static str> {
+    Ok(match name {
+        "generic" => r#"# semdoc template: generic document library
+[table]
+name = "documents"
+
+[vector]
+fields = [
+  { name = "dense_vec", dim = 1024, source = "raw_text", metric = "cosine", index = "none" },
+]
+
+[fields]
+category = { type = "string", index = true }
+source_path = { type = "string", index = true, replace_key = true }
+tags = { type = "list<string>" }
+
+[plugins.rerank]
+backend = "tei"
+endpoint = "http://127.0.0.1:8000"
+"#,
+        "code-search" => r#"# semdoc template: code search over a source tree
+[table]
+name = "documents"
+
+[vector]
+fields = [
+  { name = "dense_vec", dim = 1024, source = "raw_text", metric = "cosine", index = "none" },
+]
+
+[fields]
+language  = { type = "string", index = true }   # c / rust / python / ...
+repo      = { type = "string", index = true }   # repo name
+path      = { type = "string", index = true }   # file path, unique per doc
+symbol    = { type = "string", index = true }   # function / struct name
+source_path = { type = "string", index = true, replace_key = true }
+
+[plugins.rerank]
+backend = "tei"
+endpoint = "http://127.0.0.1:8000"
+"#,
+        "paper-library" => r#"# semdoc template: research paper library
+[table]
+name = "documents"
+
+[vector]
+fields = [
+  { name = "dense_vec", dim = 1024, source = "raw_text", metric = "cosine", index = "none" },
+]
+
+[fields]
+title    = { type = "string", index = true }
+authors  = { type = "list<string>" }
+year     = { type = "int64", index = true }
+venue    = { type = "string", index = true }
+abstract_text = { type = "text" }               # searchable via FTS
+doi      = { type = "string", index = true, replace_key = true }
+
+[plugins.rerank]
+backend = "tei"
+endpoint = "http://127.0.0.1:8000"
+"#,
+        "kernel-docs" => r#"# semdoc template: kernel / systems documentation
+# (same shape as testdata/schema.toml — the semrag use case)
+[table]
+name = "documents"
+
+[vector]
+fields = [
+  { name = "dense_vec", dim = 1024, source = "raw_text", metric = "cosine", index = "none" },
+]
+
+[fields]
+domain    = { type = "string", index = true }   # sched / mm / net
+topic     = { type = "string", index = true }   # eevdf / slab / conntrack
+version   = { type = "string", index = true }   # e.g. olk-6.6
+keywords  = { type = "list<string>" }
+source_path = { type = "string", index = true, replace_key = true }
+source_type = { type = "string" }
+
+[plugins.graph]
+backend = "lightrag-server"
+endpoint = "http://127.0.0.1:9621"
+
+[plugins.rerank]
+backend = "tei"
+endpoint = "http://192.168.1.7:8000"
+"#,
+        other => anyhow::bail!(
+            "unknown template `{other}` — available: generic, code-search, paper-library, kernel-docs"
+        ),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_minimal() {
+        let c: SchemaConfig = toml::from_str("").unwrap();
+        assert_eq!(c.table.name, "documents");
+        assert!(c.vector.fields.is_empty());
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn parse_full() {
+        let raw = r#"
+[table]
+name = "docs"
+
+[[vector.fields]]
+name = "dense_vec"
+dim = 1024
+source = "raw_text"
+
+[[vector.fields]]
+name = "title_vec"
+dim = 768
+source = "notes"
+metric = "l2"
+index = "ivf_pq"
+
+[fields]
+category = { type = "string", index = true }
+notes = { type = "text" }
+score = { type = "float32", index = true }
+
+[plugins.graph]
+backend = "lightrag-server"
+endpoint = "http://127.0.0.1:9727"
+
+[plugins.rerank]
+backend = "tei"
+endpoint = "http://x:8000"
+"#;
+        let c: SchemaConfig = toml::from_str(raw).unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.vector.fields.len(), 2);
+        assert_eq!(c.fields.len(), 3);
+        assert_eq!(c.text_fields(), vec!["notes"]);
+    }
+
+    #[test]
+    fn reject_bad_source() {
+        let c: SchemaConfig = toml::from_str(
+            r#"
+[[vector.fields]]
+name = "v"
+dim = 8
+source = "nonexistent"
+"#,
+        )
+        .unwrap();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn reject_reserved_collision() {
+        let c: SchemaConfig = toml::from_str(
+            r#"
+[fields]
+id = { type = "string" }
+"#,
+        )
+        .unwrap();
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn reject_text_with_scalar_index() {
+        let c: SchemaConfig = toml::from_str(
+            r#"
+[fields]
+notes = { type = "text", index = true }
+"#,
+        )
+        .unwrap();
+        assert!(c.validate().is_err());
+    }
+}
+
+#[cfg(test)]
+mod template_tests {
+    use super::*;
+
+    #[test]
+    fn all_templates_parse_and_validate() {
+        for name in ["generic", "code-search", "paper-library", "kernel-docs"] {
+            let content = template_schema_content(name).unwrap();
+            let cfg: SchemaConfig = toml::from_str(content)
+                .unwrap_or_else(|e| panic!("template {name}: parse: {e}"));
+            cfg.validate().unwrap_or_else(|e| panic!("template {name}: validate: {e}"));
+        }
+    }
+
+    #[test]
+    fn unknown_template_lists_available() {
+        let err = template_schema_content("nope").unwrap_err();
+        assert!(err.to_string().contains("generic, code-search"), "{err}");
+    }
+
+    #[test]
+    fn templates_are_distinct() {
+        let g = template_schema_content("generic").unwrap();
+        let c = template_schema_content("code-search").unwrap();
+        assert_ne!(g, c);
+        // kernel-docs wires a graph plugin; others don't
+        let k: SchemaConfig = toml::from_str(template_schema_content("kernel-docs").unwrap()).unwrap();
+        assert!(k.plugins.graph.is_some());
+        let g_cfg: SchemaConfig = toml::from_str(g).unwrap();
+        assert!(g_cfg.plugins.graph.is_none());
+    }
+}
