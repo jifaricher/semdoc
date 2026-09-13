@@ -25,9 +25,9 @@ struct Args {
     config: Option<String>,
 }
 
-// Business logic (Server/tools_list/dispatch) lives in semdoc::mcp so the
+// Business logic (Server/tools_list/dispatch) lives in semdocs::mcp so the
 // HTTP transport in semdoc-server shares the exact same tool surface.
-pub use semdoc::mcp::Server;
+pub use semdocs::mcp::Server;
 
 enum ReadResult {
     Eof,
@@ -90,7 +90,7 @@ async fn main() -> Result<()> {
                         let params = msg.get("params").cloned().unwrap_or(json!({}));
                         let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
                         let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
-                        semdoc::mcp::dispatch(&server, name, &arguments).await
+                        semdocs::mcp::dispatch(&server, name, &arguments).await
                     }
                     other => json!({
                         "error": { "code": -32601, "message": format!("method not found: {other}") }

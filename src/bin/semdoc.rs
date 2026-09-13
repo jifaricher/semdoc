@@ -7,14 +7,14 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use semdoc::query::{record_json, Engine, ExpandTo};
-use semdoc::schema::SchemaConfig;
-use semdoc::store::{InputDoc, Record, Store};
+use semdocs::query::{record_json, Engine, ExpandTo};
+use semdocs::schema::SchemaConfig;
+use semdocs::store::{InputDoc, Record, Store};
 
-static DEPLOY: std::sync::OnceLock<semdoc::config::DeploymentConfig> = std::sync::OnceLock::new();
+static DEPLOY: std::sync::OnceLock<semdocs::config::DeploymentConfig> = std::sync::OnceLock::new();
 
-fn deploy() -> &'static semdoc::config::DeploymentConfig {
-    DEPLOY.get_or_init(|| semdoc::config::DeploymentConfig::load(None).expect("load deployment config"))
+fn deploy() -> &'static semdocs::config::DeploymentConfig {
+    DEPLOY.get_or_init(|| semdocs::config::DeploymentConfig::load(None).expect("load deployment config"))
 }
 
 #[derive(Parser)]
@@ -41,7 +41,7 @@ impl Remote {
         Ok(Self {
             base: base.trim_end_matches('/').to_string(),
             token,
-            http: semdoc::tls::apply_blocking(reqwest::blocking::Client::builder())
+            http: semdocs::tls::apply_blocking(reqwest::blocking::Client::builder())
                 .timeout(std::time::Duration::from_secs(300))
                 .build()?,
         })
@@ -217,7 +217,7 @@ enum Cmd {
     },
 }
 
-async fn open_store(db: &str) -> Result<(semdoc::store::Store, SchemaConfig)> {
+async fn open_store(db: &str) -> Result<(semdocs::store::Store, SchemaConfig)> {
     let cfg_path = format!("{db}/schema.toml");
     let config = SchemaConfig::load(std::path::Path::new(&cfg_path))
         .map_err(|e| anyhow::anyhow!("load schema from {cfg_path}: {e}"))?;
@@ -225,10 +225,10 @@ async fn open_store(db: &str) -> Result<(semdoc::store::Store, SchemaConfig)> {
     let vec_fields = config.effective_vector_fields(1024);
     let conn = lancedb::connect(db).execute().await?;
     // Reconstruct the Store without touching indexes — `init` owns creation.
-    let store = semdoc::store::Store::new_existing(
+    let store = semdocs::store::Store::new_existing(
         conn,
         config.table.name.clone(),
-        semdoc::store::Store::arrow_schema(&config, &vec_fields),
+        semdocs::store::Store::arrow_schema(&config, &vec_fields),
         vec_fields.clone(),
         config.fields.clone(),
     );
@@ -245,7 +245,7 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let args = Args::parse();
-    let deploy = semdoc::config::DeploymentConfig::load(args.config.as_deref())?;
+    let deploy = semdocs::config::DeploymentConfig::load(args.config.as_deref())?;
     deploy.apply_chunk_env();
     DEPLOY.set(deploy).ok();
     match args.cmd {
@@ -264,7 +264,7 @@ async fn init(schema_path: Option<String>, template: Option<String>, db: String)
     let schema_path = match (schema_path, template) {
         (Some(p), None) => p,
         (None, Some(t)) => {
-            let content = semdoc::schema::template_schema_content(&t)?;
+            let content = semdocs::schema::template_schema_content(&t)?;
             let path = format!("{db}.template.schema.toml");
             std::fs::create_dir_all(&db)?;
             std::fs::write(&path, content)?;
@@ -278,8 +278,8 @@ async fn init(schema_path: Option<String>, template: Option<String>, db: String)
     // Probe the actual embedder dim once. If the config has explicit vector
     // fields, verify each auto_embed field's dim matches the embedder — a
     // mismatch is fatal at write time anyway; failing at init is kinder.
-    let probe = match semdoc::embedding::Embedder::load(&deploy().embedding) {
-        Ok(_) => semdoc::embedding::probe_dim_from_env().await,
+    let probe = match semdocs::embedding::Embedder::load(&deploy().embedding) {
+        Ok(_) => semdocs::embedding::probe_dim_from_env().await,
         Err(_) => Err(anyhow::anyhow!("embedder unavailable")),
     };
     let embedder_dim = match &probe {
@@ -354,11 +354,11 @@ async fn doctor(db: Option<String>, server: Option<String>, token: Option<String
 
     // 1. deployment config
     let deploy_path = std::env::var("SEMDOC_CONFIG").unwrap_or_else(|_| "./Config.toml".into());
-    match semdoc::config::DeploymentConfig::load(None) {
+    match semdocs::config::DeploymentConfig::load(None) {
         Ok(cfg) => {
             ok("config", &format!("{deploy_path} loads"));
             // 2. embedder probe (one real encode)
-            match semdoc::embedding::Embedder::load(&cfg.embedding) {
+            match semdocs::embedding::Embedder::load(&cfg.embedding) {
                 Ok(e) => match e.encode_blocking("doctor probe".into()).await {
                     Ok(v) => ok("embedder", &format!("probe OK, dim={}", v.len())),
                     Err(err) => {
@@ -372,7 +372,7 @@ async fn doctor(db: Option<String>, server: Option<String>, token: Option<String
                 }
             }
             // 3. reranker (optional — absence is fine)
-            match semdoc::reranker::Reranker::load(&cfg.rerank) {
+            match semdocs::reranker::Reranker::load(&cfg.rerank) {
                 Ok(_) => ok("reranker", "configured and loadable"),
                 Err(e) => {
                     let m = format!("{e:#}");
@@ -448,7 +448,7 @@ async fn doctor(db: Option<String>, server: Option<String>, token: Option<String
     if let Some(db) = &db {
         let cfg_path = format!("{db}/schema.toml");
         if let Ok(config) = SchemaConfig::load(std::path::Path::new(&cfg_path)) {
-            let graph = semdoc::plugins::graph::build_graph_plugin(&config.plugins.graph).await?;
+            let graph = semdocs::plugins::graph::build_graph_plugin(&config.plugins.graph).await?;
             if graph.name() == "none" {
                 warn("graph", "not configured — query_graph degrades to semantic");
             } else {
@@ -552,11 +552,11 @@ async fn add(
         extra.entry("source_type".to_string())
             .or_insert_with(|| serde_json::Value::String("file".to_string()));
     }
-    let embedder = semdoc::embedding::load_from_env()?;
+    let embedder = semdocs::embedding::load_from_env()?;
     let doc_id = blake3::hash(text.as_bytes()).to_hex().to_string();
     // Graph plugin is needed both for replace (delete old mirror) and the
     // insert mirror below. Build it up front.
-    let graph = semdoc::plugins::graph::build_graph_plugin(&config.plugins.graph).await?;
+    let graph = semdocs::plugins::graph::build_graph_plugin(&config.plugins.graph).await?;
     // Replace-on-add: same semantics as MCP add_document — delete the old
     // version matching every replace_key before writing the new one.
     let replaced = replace_old_versions(&store, &config, &extra, &doc_id, graph.as_ref()).await?;
@@ -595,7 +595,7 @@ pub async fn replace_old_versions(
     config: &SchemaConfig,
     extra: &serde_json::Map<String, serde_json::Value>,
     new_doc_id: &str,
-    graph: &dyn semdoc::plugins::graph::GraphPlugin,
+    graph: &dyn semdocs::plugins::graph::GraphPlugin,
 ) -> Result<Option<String>> {
     let rk = config.replace_key_fields();
     if rk.is_empty() {
@@ -657,7 +657,7 @@ async fn delete(
     // lightrag mirror: busy-retried (3 attempts, 10s/20s backoff). Failure
     // leaves graph residue — reported, and the same command can be re-run
     // later to clean up (delete is idempotent on both sides).
-    let graph = semdoc::plugins::graph::build_graph_plugin(&config.plugins.graph).await?;
+    let graph = semdocs::plugins::graph::build_graph_plugin(&config.plugins.graph).await?;
     if graph.name() != "none" {
         match graph.delete_with_retry(&target, 3).await {
             Ok(()) => println!("deleted {target} (lancedb + lightrag)"),
@@ -684,7 +684,7 @@ fn detect_language(path: &str, text: &str) -> String {
 /// every auto-embed vector column.
 pub async fn write_doc(
     store: &Store,
-    embedder: &semdoc::embedding::Embedder,
+    embedder: &semdocs::embedding::Embedder,
     doc: InputDoc,
 ) -> Result<()> {
     use std::collections::HashMap;
@@ -695,7 +695,7 @@ pub async fn write_doc(
     // Parent record + vectors
     let mut parent_vectors: HashMap<String, Vec<f32>> = HashMap::new();
     let mut leaf_vectors: HashMap<String, Vec<f32>> = HashMap::new();
-    let leaves_src = semdoc::chunker::chunk_for(&doc.raw_text, &doc_id, language.as_deref(), &source_path);
+    let leaves_src = semdocs::chunker::chunk_for(&doc.raw_text, &doc_id, language.as_deref(), &source_path);
 
     for vf in &store.vector_fields {
         if !vf.auto_embed {
@@ -830,8 +830,8 @@ async fn query(
     }
     let db = db.expect("clap: db or server required");
     let (store, config) = open_store(&db).await?;
-    let embedder = semdoc::embedding::Embedder::load(&deploy().embedding)?;
-    let reranker = match semdoc::reranker::Reranker::load(&deploy().rerank) {
+    let embedder = semdocs::embedding::Embedder::load(&deploy().embedding)?;
+    let reranker = match semdocs::reranker::Reranker::load(&deploy().rerank) {
         Ok(r) => Some(std::sync::Arc::new(r)),
         Err(e) => {
             eprintln!("[rerank] unavailable: {e:#}");
@@ -841,7 +841,7 @@ async fn query(
     let engine = Engine { store, embedder, reranker, config };
 
     let sql = match (filter, filter_sql) {
-        (Some(f), _) => Some(semdoc::query::Pred::from_json(
+        (Some(f), _) => Some(semdocs::query::Pred::from_json(
             &serde_json::from_str::<serde_json::Value>(&f)?,
         )?
         .compile(&engine.config)?),
