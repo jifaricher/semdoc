@@ -1,27 +1,41 @@
-# semdoc — the schema is a config file, not a struct
+<p align="center">
+  <img src="docs/demo.gif" alt="semdoc 30-second demo: template init, ingest, semantic + full-text search" width="100%">
+</p>
+
+# semdocs — a schema-configurable RAG knowledge base, served over MCP
 
 <p align="center">
   <a href="README_ZH.md">中文文档</a> ·
   <a href="#quickstart">Quickstart</a> ·
   <a href="#mcp-use-with-claude-code">MCP / Claude Code</a> ·
   <a href="#hybrid-search">Hybrid search</a> ·
-  <a href="#filtering">Filtering</a>
+  <a href="#filtering">Filtering</a> ·
+  <a href="https://crates.io/crates/semdocs"><img src="https://img.shields.io/crates/v/semdocs.svg" alt="crates.io"></a>
+  <a href="https://github.com/jifaricher/semdoc/actions"><img src="https://img.shields.io/github/actions/workflow/status/jifaricher/semdoc/ci.yml?branch=dev" alt="CI"></a>
+  <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-MIT_OR_Apache--2.0-blue.svg" alt="license"></a>
 </p>
 
-<p align="center">
-  <img src="docs/demo.gif" alt="semdoc 30-second demo: template init, ingest, semantic + full-text search" width="100%">
-</p>
+**Define your entire RAG knowledge base in one TOML file — then use it
+from Claude, Cursor or any MCP client as 11 ready-made tools.**
 
-**semdoc** is a vector knowledge base where the metadata schema is a
-configuration file, not a hardcoded struct. One `schema.toml` → one
-knowledge base; point it at a different schema and you have a different
-product. Storage (LanceDB), retrieval, embeddings, reranking and graph
-reasoning (LightRAG) are all pluggable.
+Most RAG stores hardcode your metadata columns (`doc_type`, `subsystem`, ...).
+In semdoc the schema **is** a configuration file: declare the fields, vector
+columns and graph plugins once — semdoc compiles the Mongo-style filter DSL,
+the MCP tool schemas, the Web UI and physical-schema compatibility checks
+from that single declaration. Same binary, different `schema.toml` → a
+different product.
 
-Most RAG stores fix your metadata columns (`doc_type`, `subsystem`, ...).
-semdoc lets you declare them — and compiles filtering, MCP tool schemas,
-the Web UI and physical-schema compatibility checks from that single
-declaration.
+```bash
+cargo install semdocs          # CLI + HTTP server + MCP server, one binary each
+semdoc init --template code-search --db ./mydb
+semdoc add --db ./mydb --file src/main.rs --meta language=rust
+```
+
+Then wire it into Claude Code (or any MCP client) in one line:
+
+```bash
+claude mcp add --transport http semdoc http://localhost:8092/mcp   --header "Authorization: Bearer $SEMDOC_MCP_TOKEN"
+```
 
 ```toml
 [vector]
