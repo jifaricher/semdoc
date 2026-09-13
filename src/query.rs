@@ -333,16 +333,20 @@ impl Engine {
 
     /// Reranked query: leaf over-recall → cross-encoder → chunk results.
     /// Degrades to ANN order on rerank failure.
+    /// `recall_k` = how many leaf candidates go into the cross-encoder.
+    /// None → default (RERANK_RECALL_K=80, always >= limit). Smaller values
+    /// cut the dominant rerank cost linearly at some recall loss.
     pub async fn query_reranked(
         &self,
         text: &str,
         limit: usize,
         filter_sql: Option<&str>,
+        recall_k: Option<usize>,
     ) -> Result<Vec<Record>> {
         let Some(reranker) = &self.reranker else {
             return self.query_semantic(text, limit, filter_sql, ExpandTo::Chunk).await;
         };
-        let recall_k = limit.max(RERANK_RECALL_K);
+        let recall_k = recall_k.unwrap_or(RERANK_RECALL_K).max(limit).max(1);
         let v = self.embed(text).await?;
         let leaves = self
             .store
