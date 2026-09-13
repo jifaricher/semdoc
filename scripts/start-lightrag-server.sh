@@ -110,11 +110,21 @@ cfg() { echo "${CFG[$1]:-}"; }
 
 # *_env 间接引用：读环境变量拿密钥。密钥不存在时该绑定留空
 # （lightrag 对多数绑定允许匿名），并对必填项给出明确报错。
+# Resolve a secret in one of two ways:
+#   1. `<name>_env` names an environment variable holding the value
+#      (recommended — the config file never contains secrets)
+#   2. a direct `postgres_password = "..."` style key in lightrag.toml
+#      (convenient for single-machine / intranet deployments; the file
+#      then contains a secret — keep it out of git)
+# Priority: env var named by *_env > direct key > empty.
 secret() {
-  local env_name; env_name="$(cfg "$1")"
-  if [[ -n "$env_name" ]]; then
-    printenv "$env_name" || true
+  local base="$1"; base="${base%_env}"
+  local env_name; env_name="$(cfg "${base}_env")"
+  if [[ -n "$env_name" ]] && printenv "$env_name" >/dev/null 2>&1; then
+    printenv "$env_name"
+    return
   fi
+  cfg "$base"   # direct inline value, empty when absent
 }
 
 # ---------------------------------------------------------------------------
@@ -165,7 +175,7 @@ export POSTGRES_USER="$(cfg postgres_user)"
 export POSTGRES_DATABASE="$(cfg postgres_database)"
 PG_PW="$(secret postgres_password_env)"
 if [[ -z "$PG_PW" ]]; then
-  echo "[lightrag] postgres password: env \$(cfg postgres_password_env) not set" >&2
+  echo "[lightrag] postgres password: set LIGHTRAG_PG_PASSWORD env or postgres_password in $CONFIG" >&2
   exit 1
 fi
 export POSTGRES_PASSWORD="$PG_PW"
@@ -177,7 +187,7 @@ export NEO4J_URI="$(cfg neo4j_uri)"
 export NEO4J_USERNAME="$(cfg neo4j_username)"
 NEO_PW="$(secret neo4j_password_env)"
 if [[ -z "$NEO_PW" ]]; then
-  echo "[lightrag] neo4j password: env \$(cfg neo4j_password_env) not set" >&2
+  echo "[lightrag] neo4j password: set LIGHTRAG_NEO4J_PASSWORD env or neo4j_password in $CONFIG" >&2
   exit 1
 fi
 export NEO4J_PASSWORD="$NEO_PW"

@@ -36,7 +36,9 @@ doc_status_storage = "PGDocStatusStorage"
 postgres_host = "localhost"
 postgres_port = 5455
 postgres_user = "rag"
-# 密码不写进本文件：postgres_password_env 指向环境变量名
+# 密钥两种写法（二选一，env 优先）：
+#   a) postgres_password_env = "环境变量名"   ← 推荐，密钥不落盘
+#   b) postgres_password = "值"              ← 内联，单机/内网部署方便；勿提交 git
 postgres_password_env = "LIGHTRAG_PG_PASSWORD"
 postgres_database = "rag"
 postgres_vector_index_type = "HNSW"
@@ -45,7 +47,7 @@ postgres_hnsw_ef = 200
 
 neo4j_uri = "neo4j://localhost:7687"
 neo4j_username = "neo4j"
-neo4j_password_env = "LIGHTRAG_NEO4J_PASSWORD"
+neo4j_password_env = "LIGHTRAG_NEO4J_PASSWORD"   # 或直接 neo4j_password = "..."
 neo4j_database = "neo4j"
 
 # ---------------------------------------------------------------------------
@@ -54,7 +56,7 @@ neo4j_database = "neo4j"
 llm_binding = "openai"
 llm_binding_host = "http://120.79.51.151:13825/v1"
 llm_model = "auto"
-llm_binding_api_key_env = "LIGHTRAG_LLM_API_KEY"
+llm_binding_api_key_env = "LIGHTRAG_LLM_API_KEY"   # 或直接 llm_binding_api_key = "..."
 
 # ---------------------------------------------------------------------------
 # Embedding 绑定（必须与 semdoc 的 [embedding] 同一模型，否则图谱/语义空间错位）
@@ -63,7 +65,7 @@ embedding_binding = "ollama"
 embedding_binding_host = "http://192.168.1.7:11434"
 embedding_model = "bge-m3"
 embedding_dim = 1024
-embedding_binding_api_key_env = "LIGHTRAG_EMBEDDING_API_KEY"
+embedding_binding_api_key_env = "LIGHTRAG_EMBEDDING_API_KEY"   # 或直接 embedding_binding_api_key = "..."
 
 # ---------------------------------------------------------------------------
 # Rerank 绑定（mix 模式查询时重排）
@@ -71,4 +73,4 @@ embedding_binding_api_key_env = "LIGHTRAG_EMBEDDING_API_KEY"
 rerank_binding = "cohere"
 rerank_model = "BAAI/bge-reranker-v2-m3"
 rerank_binding_host = "http://192.168.1.7:8000/rerank"
-rerank_binding_api_key_env = "LIGHTRAG_RERANK_API_KEY"
+rerank_binding_api_key_env = "LIGHTRAG_RERANK_API_KEY"   # 或直接 rerank_binding_api_key = "..."
