@@ -9,6 +9,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # lance's build.rs compiles protos — needs protoc on the runner
+      - run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Unit + integration tests
         run: cargo test --lib --locked
       - name: Clippy
