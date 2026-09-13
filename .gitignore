@@ -1,3 +1,9 @@
 /target
 Config.toml
 *.pid
+.semdoc-semrag-legacy/
+.semdoc.db/
+*.lance/
+lightrag.log*
+demo.template.schema.toml
+*.template.schema.toml
