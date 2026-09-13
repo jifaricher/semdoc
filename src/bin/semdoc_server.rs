@@ -87,6 +87,9 @@ struct QueryBody {
     filter: Option<Value>,
     #[serde(default)]
     expand_to: Option<String>,
+    /// query_reranked only: cross-encoder candidate pool size (default 80)
+    #[serde(default)]
+    recall_k: Option<usize>,
     /// query_graph only: true = LLM-synthesized answer (slow). Default false
     /// = structured graph data (entities/relationships/chunks) + the local
     /// documents mapped from the graph chunks (fast, no LLM).
@@ -344,7 +347,7 @@ async fn query_reranked(
     let sql = filter_sql(&state, &body).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let docs = state
         .mcp.engine
-        .query_reranked(&body.text, body.limit.unwrap_or(10).min(semdoc::query::MAX_LIMIT), sql.as_deref())
+        .query_reranked(&body.text, body.limit.unwrap_or(10).min(semdoc::query::MAX_LIMIT), sql.as_deref(), body.recall_k)
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
     Ok(Json(json!({ "documents": docs.iter().map(record_json).collect::<Vec<_>>() })))
@@ -501,7 +504,7 @@ async fn query_hybrid(
     let want_answer = body.answer.unwrap_or(false);
     let mode = if want_answer { GraphMode::Hybrid } else { GraphMode::Data };
 
-    let atomic_fut = state.mcp.engine.query_reranked(&body.text, limit, sql.as_deref());
+    let atomic_fut = state.mcp.engine.query_reranked(&body.text, limit, sql.as_deref(), body.recall_k);
     let graph_fut = state.mcp.graph.query(&body.text, mode, limit, &params);
 
     let (atomic_res, graph_res) = tokio::join!(atomic_fut, graph_fut);

@@ -160,6 +160,9 @@ enum Cmd {
         /// Filter as raw SQL (trusted input only; local db only)
         #[arg(long)]
         filter_sql: Option<String>,
+        /// rerank mode only: cross-encoder candidate pool (default 80; smaller = faster)
+        #[arg(long)]
+        recall_k: Option<usize>,
     },
     /// Delete a document (cascades: parent + leaf chunks + lightrag mirror)
     Delete {
@@ -248,7 +251,7 @@ async fn main() -> Result<()> {
     match args.cmd {
         Cmd::Init { schema, db, template } => init(schema, template, db).await,
         Cmd::Add { db, server, token, file, text, source, metas } => add(db, server, token, file, text, source, metas).await,
-        Cmd::Query { db, server, token, text, mode, limit, filter, filter_sql } => query(db, server, token, text, mode, limit, filter, filter_sql).await,
+        Cmd::Query { db, server, token, text, mode, limit, filter, filter_sql, recall_k } => query(db, server, token, text, mode, limit, filter, filter_sql, recall_k).await,
         Cmd::Delete { db, server, token, id, force } => delete(db, server, token, id, force).await,
         Cmd::Reindex { db, force } => reindex(db, force).await,
         Cmd::Doctor { db, server, token } => doctor(db, server, token).await,
@@ -786,6 +789,7 @@ async fn query(
     limit: usize,
     filter: Option<String>,
     filter_sql: Option<String>,
+    recall_k: Option<usize>,
 ) -> Result<()> {
     // Remote: Mongo-style filter JSON is sent as-is (server compiles it
     // against the db schema). Raw SQL never crosses the network.
@@ -811,6 +815,11 @@ async fn query(
         }
         if mode == "parent" {
             body["expand_to"] = serde_json::json!("parent");
+        }
+        if mode == "rerank" {
+            if let Some(k) = recall_k {
+                body["recall_k"] = serde_json::json!(k);
+            }
         }
         let docs = remote.query(endpoint, body)?;
         for r in &docs {
@@ -847,7 +856,7 @@ async fn query(
         "semantic" => engine.query_semantic(&text, limit, sql.as_deref(), ExpandTo::Chunk).await?,
         "parent" => engine.query_semantic(&text, limit, sql.as_deref(), ExpandTo::Parent).await?,
         "fts" => engine.query_fts(&text, limit, sql.as_deref()).await?,
-        "rerank" => engine.query_reranked(&text, limit, sql.as_deref()).await?,
+        "rerank" => engine.query_reranked(&text, limit, sql.as_deref(), recall_k).await?,
         other => anyhow::bail!("unknown mode `{other}` (semantic|parent|fts|rerank)"),
     };
     for r in &results {

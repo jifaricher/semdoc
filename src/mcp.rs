@@ -201,6 +201,7 @@ impl Server {
                         "properties": {
                             "text": { "type": "string", "description": "查询文本" },
                             "limit": { "type": "integer", "default": 10 },
+                            "recall_k": { "type": "integer", "default": 80, "description": "送精排的候选池大小（>= limit）。调小可线性降低 rerank 耗时（80 候选约 20s+，10 候选约 3s），代价是召回略降" },
                             "filter": { "type": "object", "description": "Mongo 风格过滤（同 query_semantic）" }
                         },
                         "required": ["text"]
@@ -348,7 +349,8 @@ pub async fn dispatch(server: &Server, name: &str, args: &Value) -> Value {
             let res = if name == "query_text" {
                 server.engine.query_fts(text, limit, filter.as_deref()).await
             } else if name == "query_reranked" {
-                server.engine.query_reranked(text, limit, filter.as_deref()).await
+                let recall_k = args.get("recall_k").and_then(|v| v.as_u64()).map(|v| v as usize);
+                server.engine.query_reranked(text, limit, filter.as_deref(), recall_k).await
             } else {
                 let expand_to = args
                     .get("expand_to")
@@ -957,7 +959,7 @@ async fn query_hybrid_via_plugin(
         max_total_tokens: n("max_total_tokens"),
     };
 
-    let atomic_fut = server.engine.query_reranked(text, limit, filter_sql);
+    let atomic_fut = server.engine.query_reranked(text, limit, filter_sql, None);
     let graph_fut = server.graph.query(text, mode, limit, &params);
     let (atomic_res, graph_res) = tokio::join!(atomic_fut, graph_fut);
 
