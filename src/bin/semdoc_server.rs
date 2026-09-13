@@ -90,11 +90,11 @@ struct QueryBody {
     /// query_reranked only: cross-encoder candidate pool size (default 80)
     #[serde(default)]
     recall_k: Option<usize>,
-    /// query_graph only: true = LLM-synthesized answer (slow). Default false
-    /// = structured graph data (entities/relationships/chunks) + the local
-    /// documents mapped from the graph chunks (fast, no LLM).
+    /// query_graph/query_hybrid: true = additionally call the LLM for a
+    /// synthesized natural-language answer (slow, 27-60s uncached).
+    /// Default false = structured graph data + mapped local documents.
     #[serde(default)]
-    answer: Option<bool>,
+    synthesize: Option<bool>,
     /// Graph-layer knobs passed through to lightrag's QueryParam
     /// (query_graph / query_hybrid; unset = lightrag defaults).
     #[serde(default)]
@@ -362,7 +362,7 @@ async fn query_graph(
         return Err((StatusCode::UNAUTHORIZED, "unauthorized".into()));
     }
     let limit = body.limit.unwrap_or(10).min(semdoc::query::MAX_LIMIT);
-    let want_answer = body.answer.unwrap_or(false);
+    let want_answer = body.synthesize.unwrap_or(false);
     // Filter is validated (compile errors surface as 400) but graph queries
     // don't consume SQL — the graph backend has its own metadata filtering.
     let _ = filter_sql(&state, &body).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
@@ -379,7 +379,7 @@ async fn query_graph(
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
             return Ok(Json(json!({
                 "degraded": true,
-                "answer": Value::Null,
+                "synthesized": Value::Null,
                 "graph": Value::Null,
                 "documents": docs.iter().map(record_json).collect::<Vec<_>>(),
             })));
@@ -482,7 +482,7 @@ async fn query_graph(
 
     Ok(Json(json!({
         "degraded": false,
-        "answer": answer.content,
+        "synthesized": answer.content,
     })))
 }
 
@@ -501,7 +501,7 @@ async fn query_hybrid(
     let limit = body.limit.unwrap_or(10).min(semdoc::query::MAX_LIMIT);
     let sql = filter_sql(&state, &body).map_err(|e| (StatusCode::BAD_REQUEST, e))?;
     let params = graph_params(&body);
-    let want_answer = body.answer.unwrap_or(false);
+    let want_answer = body.synthesize.unwrap_or(false);
     let mode = if want_answer { GraphMode::Hybrid } else { GraphMode::Data };
 
     let atomic_fut = state.mcp.engine.query_reranked(&body.text, limit, sql.as_deref(), body.recall_k);
@@ -512,12 +512,12 @@ async fn query_hybrid(
     // Graph side: degrade to empty (semantic already covered by atomic side).
     let mut merged: Vec<Value> = Vec::new();
     let mut degraded = false;
-    let mut answer_json = Value::Null;
+    let mut synthesized_json = Value::Null;
     let mut graph_json = Value::Null;
     match graph_res {
         Ok(a) => {
             if want_answer {
-                answer_json = Value::String(a.content);
+                synthesized_json = Value::String(a.content);
             } else if let Ok(raw) = serde_json::from_str::<Value>(&a.content) {
                 graph_json = raw.get("data").cloned().unwrap_or(Value::Null);
                 // Map docs but don't dedupe against atomic here — merge below
@@ -593,7 +593,7 @@ async fn query_hybrid(
             }
         }
     } else {
-        merged.push(json!({ "answer": answer_json }));
+        merged.push(json!({ "synthesized": synthesized_json }));
     }
 
     if let Ok(atomic) = atomic_res {
@@ -608,7 +608,7 @@ async fn query_hybrid(
     }
     Ok(Json(json!({
         "degraded": degraded,
-        "answer": answer_json,
+        "synthesized": synthesized_json,
         "graph": graph_json,
         "documents": merged,
     })))

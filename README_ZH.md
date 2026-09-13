@@ -57,8 +57,8 @@ GET  /documents/:id         精查一条（raw_text 不截断）
 POST /query/semantic        {text, limit, filter?, expand_to?}
 POST /query/text            {text, limit, filter?}        BM25 全文检索
 POST /query/reranked        {text, limit, filter?}        cross-encoder 精排
-POST /query/graph           {text, limit, answer?}        图谱检索（不可用自动降级）
-POST /query/hybrid          {text, limit, answer?}        语义+图谱并行合并
+POST /query/graph           {text, limit, synthesize?}    图谱检索（不可用自动降级）
+POST /query/hybrid          {text, limit, synthesize?}    语义+图谱并行合并
 GET  /stats                 统计
 GET  /health                健康检查
 ```
@@ -143,7 +143,7 @@ session 重发一次。工具调用均为单请求语义（无服务端多步事
 | `query_semantic` | 语义检索（small-to-big：叶子 chunk ANN，按 `expand_to` 展开 chunk/parent/auto） |
 | `query_text` | BM25 全文检索，适合精确术语/函数名 |
 | `query_reranked` | ANN 召回 80 条 + cross-encoder 精排（需 `--rerank`，故障自动降级） |
-| `query_graph` | 图谱检索。默认返回结构化实体/关系/chunk+映射本地文档；`answer=true` 走 LLM 综合答案（慢） |
+| `query_graph` | 图谱检索。默认返回结构化实体/关系/chunk+映射本地文档；`synthesize=true` 走 LLM 综合答案（慢，未缓存 27-60s） |
 | `query_hybrid` | 语义（reranked）与图谱并行，按 id 合并去重 |
 | `get_document` | 按 id 精查，raw_text 完整不截断 |
 | `add_document` | 写入：切块+自动嵌入+入库；同文本幂等 upsert（修改正文后刷新向量的正确方式）；镜像到图谱 |
