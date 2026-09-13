@@ -931,7 +931,7 @@ async fn ui_index(
             html_escape(short_id),
             html_escape(&d.raw_text.chars().take(90).collect::<String>())
         );
-        for (name, _) in state.mcp.engine.config.fields.iter() {
+        for name in state.mcp.engine.config.fields.keys() {
             let v = d
                 .extra
                 .get(name)
