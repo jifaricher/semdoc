@@ -1,0 +1,37 @@
+# semdoc schema — 等价于 semrag 的 documents 表结构。
+#
+# semrag 固定的 9 列(id/raw_text/chunk_level/chunk_index/parent_doc_id/
+# source_path/source_type + doc_type 等元数据)在 semdoc 中的对应:
+# - id/raw_text/chunk_level/chunk_index/parent_doc_id 仍是保留列(自动存在)
+# - source_path/source_type 现在是普通 [fields] 字段(本 schema 显式声明,
+#   兼容旧库的物理列)
+# - semrag 的 7 个元数据列全部在 [fields] 声明,一一对应
+# 向量列 dense_vec dim=1024(bge-m3)。
+
+[table]
+name = "documents"
+
+[vector]
+fields = [
+  { name = "dense_vec", dim = 1024, source = "raw_text", metric = "cosine", index = "none" },
+]
+
+[fields]
+doc_type      = { type = "string", index = true, replace_key = false }  # kernel_doc / test_case / feature_doc ...
+version       = { type = "string", index = true }   # e.g. olk-6.6
+subsystem     = { type = "string", index = true }   # sched / mm / cgroup ...
+feature       = { type = "string", index = true }   # mixed_qos / smt_expulsion ...
+language      = { type = "string" }                 # markdown / c / text
+function_name = { type = "string", index = true }   # 函数名文档
+# 来源字段(旧库物理列,声明后可继续读旧数据并可参与过滤)
+source_path   = { type = "string", index = true }
+source_type   = { type = "string" }
+# 注:language 是自由标注,不过滤;其余均可参与 Mongo-style filter。
+# 如需"改文重发同路径自动替换旧版",给 source_path 加 replace_key = true。
+
+# graph 插件:semrag 同款 lightrag-server(workspace=semdoc_kernel)
+[plugins.graph]
+backend = "lightrag-server"
+endpoint = "http://127.0.0.1:9621"
+query_timeout_secs = 120
+insert_concurrency = 4

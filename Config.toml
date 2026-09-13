@@ -1,0 +1,167 @@
+# =============================================================================
+# semdoc 全量配置模板
+# =============================================================================
+# 本文件包含两类配置。实际使用时按需拆成两个文件:
+#
+#   1. schema.toml  — 库语义([table]/[vector]/[fields]/[plugins])
+#                     跟数据库走,`semdoc init` 时拷贝进 <db>/schema.toml
+#   2. Config.toml  — 部署事实([embedding]/[rerank]/[chunk]/[server]/[tls])
+#                     跟环境走,不随库迁移
+#
+# 查找顺序: --config <path> > $SEMDOC_CONFIG > ./Config.toml > 默认值+env
+# 优先级:   CLI flag > 环境变量 > 本文件 > 内置默认
+# 密钥:     本文件只写 *_env(环境变量名),值本身放环境变量
+# =============================================================================
+
+
+# =============================================================================
+# 第一部分:schema.toml(库语义)
+# =============================================================================
+
+[table]
+# LanceDB 表名(每库一表)
+# 默认: "documents"
+name = "documents"
+
+# ---------------------------------------------------------------------------
+# 向量列定义。未写 [vector] 时自动派生单列:
+#   dense_vec, dim=默认 embedder 维度(1024), source="raw_text",
+#   metric="cosine", index="none", auto_embed=true
+# 支持多向量列(多路检索)。
+# ---------------------------------------------------------------------------
+[[vector.fields]]
+# 列名(不可与保留列/其他字段冲突)
+name = "dense_vec"
+# 向量维度,必须与嵌入模型输出一致(init 时校验)
+# 必填
+dim = 1024
+# 嵌入来源: "raw_text" 或 [fields] 中 type="text" 的字段
+# 必填
+source = "raw_text"
+# 距离度量: "cosine"(默认) | "l2" | "dot"
+metric = "cosine"
+# 向量索引: "none"(默认,暴力检索,中小库推荐) | "ivf_pq" | "ivf_flat"
+index = "none"
+# 写入时自动嵌入;false = 只接受客户端预嵌入
+# 默认: true
+auto_embed = true
+
+# ---------------------------------------------------------------------------
+# 用户自定义标量字段。全部可选——不需要就不写。
+# 类型: string | text | bool | int64 | float32 | timestamp | list<string>
+#   string       短元数据,可等值/范围过滤,可建索引
+#   text         长文本,FTS 检索,可作向量 source,不可建标量索引
+#   list<string> 数组,$in/$nin 成员过滤
+# ---------------------------------------------------------------------------
+[fields]
+# domain = { type = "string",  index = true }              # index 默认 false
+# score  = { type = "float32" }                            # required 默认 false
+# tags   = { type = "list<string>" }
+# notes  = { type = "text" }                               # 不可 index = true
+
+# ---------------------------------------------------------------------------
+# 图检索插件。不写 = 禁用(query_graph 类查询降级 semantic)。
+# 部署连接细节(endpoint/密钥)也可放 Config.toml 覆盖。
+# ---------------------------------------------------------------------------
+# backend = "lightrag-server"(HTTP,零 Python)| "lightrag-embedded"(PyO3,需 feature)
+[plugins.graph]
+backend = "lightrag-server"
+# 必填(lightrag-server)
+endpoint = "http://127.0.0.1:9727"
+# 密钥的环境变量名(可选用)
+# api_key_env = "LIGHTRAG_API_KEY"
+# 查询超时秒数
+# 默认: 60
+query_timeout_secs = 60
+# 后台 insert 并发上限
+# 默认: 4
+insert_concurrency = 4
+# lightrag-embedded 专用:工作目录
+# workspace = "./rag_storage"
+
+# ---------------------------------------------------------------------------
+# rerank 插件(schema 侧声明;部署细节放 Config.toml [rerank] 优先)。
+# backend: "onnx"(本地 INT8,需 feature onnx)| "tei" | "openai"
+# ---------------------------------------------------------------------------
+[plugins.rerank]
+backend = "tei"
+endpoint = "http://192.168.1.7:8000"
+# api_key_env = "MY_TEI_KEY"
+# 默认: 60
+timeout_secs = 60
+# openai 专用:
+# model = "bge-reranker-v2-m3"
+
+
+# =============================================================================
+# 第二部分:Config.toml(部署事实)
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# 嵌入后端。backend: "onnx"(默认)| "http"(OpenAI 兼容 /v1/embeddings)
+# ---------------------------------------------------------------------------
+[embedding]
+backend = "http"
+# http: endpoint(含 /v1),必填
+url = "http://192.168.1.7:11434/v1"
+# http: 模型名,必填
+model = "bge-m3"
+# 密钥的环境变量名(可选)
+# api_key_env = "MY_EMBEDDER_KEY"
+# 请求超时秒数
+# 默认: 60
+# timeout_secs = 60
+# onnx 专用:模型目录
+# 默认: ~/.cache/semdoc/models/bge-m3
+# dir = "~/.cache/semdoc/models/bge-m3"
+
+# ---------------------------------------------------------------------------
+# rerank 后端。backend: "onnx"(默认)| "tei" | "openai" | "none"(禁用)
+# ---------------------------------------------------------------------------
+[rerank]
+backend = "tei"
+# tei/openai: endpoint(openai 需含 /v1),必填
+endpoint = "http://192.168.1.7:8000"
+# api_key_env = "MY_TEI_KEY"
+# 请求超时秒数
+# 默认: 120
+# timeout_secs = 120
+# openai 专用:模型名(可选)
+# model = "bge-reranker-v2-m3"
+# onnx 专用:
+# 默认: ~/.cache/semdoc/models/bge-reranker-v2-m3
+# dir = "~/.cache/semdoc/models/bge-reranker-v2-m3"
+
+# ---------------------------------------------------------------------------
+# 分块参数(写入时生效)
+# ---------------------------------------------------------------------------
+[chunk]
+# 目标块大小(Unicode 字符),范围 [64, 8192]
+# 默认: 512
+size = 512
+# 相邻块重叠字符数(约 size 的 10%)
+# 默认: 50
+overlap = 50
+
+# ---------------------------------------------------------------------------
+# HTTP server 参数(semdoc-server 读取)
+# ---------------------------------------------------------------------------
+[server]
+# 监听地址
+# 默认: "127.0.0.1:8092"(CLI --listen 可覆盖)
+listen = "127.0.0.1:8092"
+# Bearer token 的环境变量名;不写 = 不鉴权
+# token_env = "SEMDOC_SERVER_TOKEN"
+
+# ---------------------------------------------------------------------------
+# TLS
+# ---------------------------------------------------------------------------
+[tls]
+# 接受自签证书(内网自建 endpoint 用)。
+# 默认: false。注意:开启后所有出站 HTTPS 的证书验证被完全禁用,
+# Bearer 密钥可能被中间人截获——优先使用 ca_bundle。
+insecure = false
+# 公司内部 CA 证书(PEM 格式,可含多张):加进信任链但保留其余验证。
+# 例: ca_bundle = "/etc/semdoc/company-ca.pem"
+# 默认: 不设置(只用系统证书库)
+# ca_bundle = ""

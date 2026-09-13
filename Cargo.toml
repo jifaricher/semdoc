@@ -1,0 +1,69 @@
+[package]
+name = "semdocs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Config-schema-driven vector knowledge base: LanceDB storage, pluggable embedding/reranker/graph backends, CLI + HTTP REST + MCP (stdio & streamable HTTP)"
+keywords = ["rag", "vector-database", "embeddings", "mcp", "knowledge-base"]
+categories = ["database-implementations", "science", "text-processing", "command-line-utilities"]
+repository = "https://github.com/jifaricher/semdoc"
+readme = "README.md"
+
+[dependencies]
+tokio = { version = "1.49", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+clap = { version = "4.5", features = ["derive"] }
+lancedb = "0.31.0"
+arrow = "58.3"
+arrow-array = "58.3"
+arrow-schema = "58.3"
+reqwest = { version = "0.13", features = ["blocking", "gzip", "json", "query"] }
+blake3 = "1.8"
+axum = "0.7"
+async-trait = "0.1"
+ort = { version = "2.0.0-rc.12", optional = true }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"], optional = true }
+ndarray = { version = "0.17", optional = true }
+pyo3 = { version = "0.21", features = ["auto-initialize"], optional = true }
+rusqlite = { version = "0.32", features = ["bundled"] }
+futures = "0.3"
+anyhow = "1"
+thiserror = "2"
+urlencoding = "2"
+md-5 = "0.10"
+hmac = "0.12"
+sha2 = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+# default is the lightweight http-embedder build — `cargo install` stays
+# fast and small. ONNX in-process inference (bge-m3, INT8 reranker) is
+# opt-in: --features onnx
+default = []
+onnx = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
+lightrag-embedded = ["dep:pyo3"]
+
+[dev-dependencies]
+tempfile = "3"
+
+[[bin]]
+name = "semdoc"
+path = "src/bin/semdoc.rs"
+
+[[bin]]
+name = "semdoc-server"
+path = "src/bin/semdoc_server.rs"
+
+[[bin]]
+name = "semdoc-mcp"
+path = "src/bin/semdoc_mcp.rs"
+
+[profile.release]
+opt-level = 3
+
+[[bin]]
+name = "semdoc-migrate"
+path = "src/bin/semdoc_migrate.rs"
