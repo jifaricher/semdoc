@@ -39,7 +39,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [features]
-default = ["onnx"]
+# default is the lightweight http-embedder build — `cargo install` stays
+# fast and small. ONNX in-process inference (bge-m3, INT8 reranker) is
+# opt-in: --features onnx
+default = []
 onnx = ["dep:ort", "dep:tokenizers", "dep:ndarray"]
 lightrag-embedded = ["dep:pyo3"]
 
