@@ -64,9 +64,9 @@ impl Remote {
         Ok(serde_json::from_str(&body).unwrap_or(serde_json::Value::Null))
     }
 
-    fn add(&self, text: &str, source_path: &str, meta: serde_json::Map<String, serde_json::Value>) -> Result<serde_json::Value> {
+    fn add(&self, text: &str, source_path: &str, meta: serde_json::Map<String, serde_json::Value>, graph: bool) -> Result<serde_json::Value> {
         Self::check(self.req(reqwest::Method::POST, "/documents")
-            .json(&serde_json::json!({"text": text, "source_path": source_path, "meta": meta}))
+            .json(&serde_json::json!({"text": text, "source_path": source_path, "meta": meta, "graph": graph}))
             .send()?)
     }
 
@@ -134,6 +134,9 @@ enum Cmd {
         /// Extra field values, KEY=VALUE (repeatable)
         #[arg(long = "meta", value_delimiter = ',', action = clap::ArgAction::Append)]
         metas: Vec<String>,
+        /// Also mirror into the lightrag graph KB (default: LanceDB only)
+        #[arg(long)]
+        graph: bool,
     },
     /// Query
     Query {
@@ -250,7 +253,7 @@ async fn main() -> Result<()> {
     DEPLOY.set(deploy).ok();
     match args.cmd {
         Cmd::Init { schema, db, template } => init(schema, template, db).await,
-        Cmd::Add { db, server, token, file, text, source, metas } => add(db, server, token, file, text, source, metas).await,
+        Cmd::Add { db, server, token, file, text, source, metas, graph } => add(db, server, token, file, text, source, metas, graph).await,
         Cmd::Query { db, server, token, text, mode, limit, filter, filter_sql, recall_k } => query(db, server, token, text, mode, limit, filter, filter_sql, recall_k).await,
         Cmd::Delete { db, server, token, id, force } => delete(db, server, token, id, force).await,
         Cmd::Reindex { db, force } => reindex(db, force).await,
@@ -509,6 +512,7 @@ fn parse_metas(metas: &[String], config: &SchemaConfig) -> Result<serde_json::Ma
     Ok(extra)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn add(
     db: Option<String>,
     server: Option<String>,
@@ -517,6 +521,7 @@ async fn add(
     text: Option<String>,
     source: String,
     metas: Vec<String>,
+    mirror_graph: bool,
 ) -> Result<()> {
     if let Some(url) = server {
         let remote = Remote::new(&url, token.or_else(|| std::env::var("SEMDOC_TOKEN").ok()))?;
@@ -529,7 +534,7 @@ async fn add(
             .iter()
             .filter_map(|m| m.split_once('=').map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string()))))
             .collect();
-        remote.add(&text, &source, meta)?;
+        remote.add(&text, &source, meta, mirror_graph)?;
         println!("added (id auto-hashed from content)");
         return Ok(());
     }
@@ -571,10 +576,10 @@ async fn add(
     };
     write_doc(&store, &embedder, engine_inputs).await?;
     store.optimize_indices().await?;
-    // Mirror into the graph KB when the schema configures one. Entity
-    // extraction is LLM-bound and slow; a failure here must not lose the
-    // LanceDB write — degrade with a warning instead.
-    if graph.name() != "none" {
+    // Mirror into the graph KB only when explicitly requested (--graph).
+    // Entity extraction is LLM-bound and slow; a failure here must not lose
+    // the LanceDB write — degrade with a warning instead.
+    if mirror_graph && graph.name() != "none" {
         if let Err(e) = graph.insert(vec![(text, doc_id)]).await {
             eprintln!("[graph] insert degraded: {e:#}");
         }

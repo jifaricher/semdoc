@@ -256,7 +256,7 @@ impl Server {
                 },
                 {
                     "name": "add_document",
-                    "description": "写入一篇文档：自动切块（parent + 叶子 chunk）、自动向量化（schema 声明的 auto_embed 向量列）并入库；若库配置了图谱插件则同步镜像到 lightrag（实体抽取异步进行，失败只告警不影响入库）。返回文档 id（blake3(全文)）。重复添加相同文本为幂等 upsert：同 id 覆盖旧 parent+chunks 并自动重嵌入——也是修改正文后刷新向量的正确方式。",
+                    "description": "写入一篇文档：自动切块（parent + 叶子 chunk）、自动向量化（schema 声明的 auto_embed 向量列）并入库；默认不写入 lightrag 图谱，仅当 graph=true 且库配置了图谱插件时才同步镜像（实体抽取异步进行，失败只告警不影响入库）。返回文档 id（blake3(全文)）。重复添加相同文本为幂等 upsert：同 id 覆盖旧 parent+chunks 并自动重嵌入——也是修改正文后刷新向量的正确方式。",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -264,7 +264,8 @@ impl Server {
                             "source_path": { "type": "string", "description": "来源路径标签（如文件路径），建议必填以便追溯" },
                             "source_type": { "type": "string", "description": "来源形态（file/text/directory/glob 等，默认 text）" },
                             "language": { "type": "string", "description": "语言提示（markdown 时按标题切分）" },
-                            "metadata": { "type": "object", "description": format!("schema 字段值（键值对）。本库字段: {filter_desc}。类型须匹配（int64 传整数、bool 传布尔、list<string> 传数组）。") }
+                            "metadata": { "type": "object", "description": format!("schema 字段值（键值对）。本库字段: {filter_desc}。类型须匹配（int64 传整数、bool 传布尔、list<string> 传数组）。") },
+                            "graph": { "type": "boolean", "default": false, "description": "是否同步镜像到 lightrag 图谱（需库已配置图谱插件；实体抽取异步，失败只告警）。默认 false 不写入图谱" }
                         },
                         "required": ["text"]
                     }
@@ -652,9 +653,16 @@ async fn add_document(server: &Server, args: &Value) -> Value {
         eprintln!("[mcp] optimize_indices: {e:#}");
     }
 
-    // Graph mirror (best-effort).
+    // Graph mirror is opt-in: only when the caller passes graph=true
+    // (best-effort; LanceDB is truth).
+    let mirror_graph = args
+        .get("graph")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let mut graph_note = String::new();
-    if server.graph.name() != "none" {
+    if mirror_graph && server.graph.name() == "none" {
+        graph_note = "（库未配置图谱插件，跳过图谱镜像）".to_string();
+    } else if mirror_graph {
         match server
             .graph
             .insert(vec![(text.to_string(), doc_id.clone())])

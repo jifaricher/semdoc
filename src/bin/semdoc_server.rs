@@ -76,6 +76,9 @@ struct AddBody {
     source_path: Option<String>,
     #[serde(default)]
     meta: serde_json::Map<String, Value>,
+    /// true = also mirror into the lightrag graph KB (default: LanceDB only)
+    #[serde(default)]
+    graph: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -237,12 +240,15 @@ async fn add_doc(
         &blake3::hash(body.text.as_bytes()).to_hex(),
         json!({ "via": "rest" }),
     );
-    // Mirror into the graph KB (entity extraction is slow; degrade loudly,
-    // never fail the write — LanceDB is the source of truth).
-    let graph_text = body.text.clone();
-    let graph_id = blake3::hash(body.text.as_bytes()).to_hex().to_string();
-    if let Err(e) = state.mcp.graph.insert(vec![(graph_text, graph_id)]).await {
-        eprintln!("[graph] insert degraded: {e:#}");
+    // Mirror into the graph KB only when the caller opts in (graph=true).
+    // Entity extraction is slow; degrade loudly, never fail the write —
+    // LanceDB is the source of truth.
+    if body.graph.unwrap_or(false) {
+        let graph_text = body.text.clone();
+        let graph_id = blake3::hash(body.text.as_bytes()).to_hex().to_string();
+        if let Err(e) = state.mcp.graph.insert(vec![(graph_text, graph_id)]).await {
+            eprintln!("[graph] insert degraded: {e:#}");
+        }
     }
     Ok(Json(json!({"ok": true})))
 }
