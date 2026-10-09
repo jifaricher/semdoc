@@ -21,8 +21,3 @@ backend = "lightrag-server"
 endpoint = "http://127.0.0.1:9621"
 query_timeout_secs = 60
 insert_concurrency = 2
-
-[plugins.rerank]
-backend = "tei"
-endpoint = "http://192.168.1.7:8000"
-api_key_env = "TEST_RERANKER_KEY"

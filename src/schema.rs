@@ -118,8 +118,6 @@ impl FieldConfig {
 pub struct PluginsConfig {
     #[serde(default)]
     pub graph: Option<GraphPluginConfig>,
-    #[serde(default)]
-    pub rerank: Option<RerankPluginConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq)]
@@ -148,35 +146,6 @@ pub enum GraphPluginConfig {
         workspace: Option<String>,
         #[serde(default = "default_query_timeout")]
         query_timeout_secs: u64,
-    },
-}
-
-#[derive(Debug, Clone, Deserialize, PartialEq)]
-#[serde(deny_unknown_fields, rename_all = "kebab-case")]
-#[serde(tag = "backend")]
-pub enum RerankPluginConfig {
-    /// In-process INT8 ONNX cross-encoder (feature `onnx`).
-    Onnx {
-        #[serde(default)]
-        dir: Option<String>,
-    },
-    /// TEI-compatible `/rerank` endpoint.
-    Tei {
-        endpoint: String,
-        #[serde(default)]
-        api_key_env: Option<String>,
-        #[serde(default = "default_query_timeout")]
-        timeout_secs: u64,
-    },
-    /// OpenAI-compatible `/v1/rerank` (base URL up to and including `/v1`).
-    Openai {
-        endpoint: String,
-        #[serde(default)]
-        api_key_env: Option<String>,
-        #[serde(default)]
-        model: Option<String>,
-        #[serde(default = "default_query_timeout")]
-        timeout_secs: u64,
     },
 }
 
@@ -283,15 +252,7 @@ impl SchemaConfig {
             }
         }
 
-        // Rerank backend vs build features.
-        if let Some(r) = &self.plugins.rerank {
-            match r {
-                RerankPluginConfig::Onnx { .. } if !cfg!(feature = "onnx") => {
-                    anyhow::bail!("rerank backend `onnx` requires building with feature `onnx`");
-                }
-                _ => {}
-            }
-        }
+        // Graph backend vs build features.
         if let Some(g) = &self.plugins.graph {
             if matches!(g, GraphPluginConfig::LightragEmbedded { .. })
                 && !cfg!(feature = "lightrag-embedded")
@@ -431,10 +392,6 @@ fields = [
 category = { type = "string", index = true }
 source_path = { type = "string", index = true, replace_key = true }
 tags = { type = "list<string>" }
-
-[plugins.rerank]
-backend = "tei"
-endpoint = "http://127.0.0.1:8000"
 "#,
         "code-search" => r#"# semdoc template: code search over a source tree
 [table]
@@ -451,10 +408,6 @@ repo      = { type = "string", index = true }   # repo name
 path      = { type = "string", index = true }   # file path, unique per doc
 symbol    = { type = "string", index = true }   # function / struct name
 source_path = { type = "string", index = true, replace_key = true }
-
-[plugins.rerank]
-backend = "tei"
-endpoint = "http://127.0.0.1:8000"
 "#,
         "paper-library" => r#"# semdoc template: research paper library
 [table]
@@ -472,10 +425,6 @@ year     = { type = "int64", index = true }
 venue    = { type = "string", index = true }
 abstract_text = { type = "text" }               # searchable via FTS
 doi      = { type = "string", index = true, replace_key = true }
-
-[plugins.rerank]
-backend = "tei"
-endpoint = "http://127.0.0.1:8000"
 "#,
         "kernel-docs" => r#"# semdoc template: kernel / systems documentation
 # (same shape as testdata/schema.toml — the semrag use case)
@@ -498,10 +447,6 @@ source_type = { type = "string" }
 [plugins.graph]
 backend = "lightrag-server"
 endpoint = "http://127.0.0.1:9621"
-
-[plugins.rerank]
-backend = "tei"
-endpoint = "http://192.168.1.7:8000"
 "#,
         other => anyhow::bail!(
             "unknown template `{other}` — available: generic, code-search, paper-library, kernel-docs"
@@ -547,10 +492,6 @@ score = { type = "float32", index = true }
 [plugins.graph]
 backend = "lightrag-server"
 endpoint = "http://127.0.0.1:9727"
-
-[plugins.rerank]
-backend = "tei"
-endpoint = "http://x:8000"
 "#;
         let c: SchemaConfig = toml::from_str(raw).unwrap();
         c.validate().unwrap();

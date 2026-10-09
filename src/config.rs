@@ -219,6 +219,7 @@ impl DeploymentConfig {
             .unwrap_or_else(|| "Config.toml".to_string());
         let base = match std::fs::read_to_string(&file_path) {
             Ok(raw) => {
+                warn_ignored_schema_sections(&raw, &file_path);
                 let cfg: DeploymentConfig = toml::from_str(&raw).map_err(|e| {
                     anyhow::anyhow!("parse deployment config {file_path}: {e}")
                 })?;
@@ -445,6 +446,32 @@ impl DeploymentConfig {
     }
 }
 
+/// A single Config.toml may carry schema sections as an init draft; they are
+/// parsed only from schema.toml and silently ignored here. Silence breeds
+/// "why isn't my graph endpoint taking effect" confusion — name the ignored
+/// sections so the user knows they belong in schema.toml.
+fn warn_ignored_schema_sections(raw: &str, file_path: &str) {
+    let present = ignored_schema_sections(raw);
+    if !present.is_empty() {
+        eprintln!(
+            "[config] warning: {file_path} contains schema section(s) {} — \
+             ignored at runtime; they belong in schema.toml (copied to <db>/schema.toml at init)",
+            present.iter().map(|s| format!("[{s}]")).collect::<Vec<_>>().join(", ")
+        );
+    }
+}
+
+/// Top-level schema sections present in `raw` that DeploymentConfig ignores.
+fn ignored_schema_sections(raw: &str) -> Vec<&'static str> {
+    const SCHEMA_SECTIONS: &[&str] = &["table", "vector", "fields", "plugins"];
+    let Ok(value) = toml::from_str::<toml::Value>(raw) else { return Vec::new() };
+    SCHEMA_SECTIONS
+        .iter()
+        .copied()
+        .filter(|k| value.get(*k).is_some())
+        .collect()
+}
+
 fn parse_env_num(name: &str, default: u64) -> anyhow::Result<u64> {
     match std::env::var(name) {
         Ok(v) => v.parse().map_err(|_| anyhow::anyhow!("bad {name} `{v}`")),
@@ -633,6 +660,16 @@ category = { type = "string" }
             .unwrap();
             assert_eq!(cfg.chunk.size, None);
         });
+    }
+
+    #[test]
+    fn ignored_schema_sections_are_detected() {
+        let found = ignored_schema_sections("[table]\nname = \"d\"\n\n[plugins.graph]\nbackend = \"lightrag-server\"\nendpoint = \"http://x:1\"\n");
+        assert_eq!(found, vec!["table", "plugins"]);
+        assert!(ignored_schema_sections("[chunk]\nsize = 300\n").is_empty());
+        assert!(ignored_schema_sections("").is_empty());
+        // Malformed TOML: no detection, no panic (parse error surfaces later).
+        assert!(ignored_schema_sections("[table").is_empty());
     }
 
     // --- validate() ---

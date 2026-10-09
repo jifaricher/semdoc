@@ -58,13 +58,3 @@ auto_embed = true
 # query_timeout_secs = 60            # 默认: 60
 # insert_concurrency = 4             # 默认: 4
 # workspace = "./rag_storage"        # lightrag-embedded 专用
-
-# ---------------------------------------------------------------------------
-# rerank 插件(可选,声明用;部署细节优先读 Config.toml [rerank])
-# ---------------------------------------------------------------------------
-# [plugins.rerank]
-# backend = "tei"                    # "onnx" | "tei" | "openai"
-# endpoint = "http://192.168.1.7:8000"
-# api_key_env = "MY_TEI_KEY"
-# timeout_secs = 60                  # 默认: 60
-# model = "bge-reranker-v2-m3"       # openai 专用
