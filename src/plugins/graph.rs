@@ -169,8 +169,11 @@ impl LightragServer {
     }
 
     fn auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        // lightrag-server compares its API key against the X-API-Key header;
+        // Authorization: Bearer is treated strictly as a JWT there, so a plain
+        // key sent via bearer_auth() would be rejected with 401.
         match &self.api_key {
-            Some(k) => req.bearer_auth(k),
+            Some(k) => req.header("X-API-Key", k),
             None => req,
         }
     }
