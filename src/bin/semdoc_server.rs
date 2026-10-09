@@ -1124,7 +1124,7 @@ async fn ui_index(
     for name in state.mcp.engine.config.fields.keys() {
         header.push_str(&sort_th(name, true));
     }
-    header.push_str("<th></th></tr>");
+    header.push_str("<th>actions</th></tr>");
 
     // Rows: id/text/fields + a delete form cell (confirm before POST).
     let mut rows = String::new();
