@@ -34,8 +34,10 @@ backend = "http"
 url = "http://192.168.1.7:11434/v1"
 # http: model name, required
 model = "bge-m3"
-# Env var NAME holding the API key (optional)
-# api_key_env = "MY_EMBEDDER_KEY"
+# API key (optional): write the env var NAME here, set the key itself in
+# the environment — the secret never touches this file:
+#   export SEMDOC_EMBEDDER_API_KEY="sk-..."
+# api_key_env = "SEMDOC_EMBEDDER_API_KEY"
 # Request timeout in seconds
 # Default: 60
 # timeout_secs = 60
@@ -52,7 +54,11 @@ model = "bge-m3"
 backend = "tei"
 # tei/openai: endpoint (openai must include /v1), required
 endpoint = "http://192.168.1.7:8000"
-# api_key_env = "MY_TEI_KEY"
+# API key (optional), same indirection as embedding:
+#   export SEMDOC_RERANKER_API_KEY="sk-..."
+# If embedder and reranker share one gateway/key, both api_key_env may
+# name the SAME env var.
+# api_key_env = "SEMDOC_RERANKER_API_KEY"
 # Request timeout in seconds
 # Default: 120
 # timeout_secs = 120

@@ -31,8 +31,9 @@ backend = "http"
 url = "http://192.168.1.7:11434/v1"
 # http: 模型名,必填
 model = "bge-m3"
-# 密钥的环境变量名(可选)
-# api_key_env = "MY_EMBEDDER_KEY"
+# 密钥(可选):这里写环境变量名,密钥本身放环境变量——不落盘:
+#   export SEMDOC_EMBEDDER_API_KEY="sk-..."
+# api_key_env = "SEMDOC_EMBEDDER_API_KEY"
 # 请求超时秒数
 # 默认: 60
 # timeout_secs = 60
@@ -48,7 +49,11 @@ model = "bge-m3"
 backend = "tei"
 # tei/openai: endpoint(openai 需含 /v1),必填
 endpoint = "http://192.168.1.7:8000"
-# api_key_env = "MY_TEI_KEY"
+# 密钥(可选),机制同 embedding:
+#   export SEMDOC_RERANKER_API_KEY="sk-..."
+# 若 embedder 与 reranker 共用同一网关/密钥,两处 api_key_env
+# 可指向同一个环境变量名。
+# api_key_env = "SEMDOC_RERANKER_API_KEY"
 # 请求超时秒数
 # 默认: 120
 # timeout_secs = 120
