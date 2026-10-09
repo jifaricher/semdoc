@@ -26,13 +26,13 @@ use anyhow::Result;
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    response::{IntoResponse, Redirect, Response},
     routing::{get, post},
-    Json, Router,
+    Form, Json, Router,
 };
 use clap::Parser;
 use semdocs::mcp::Server as McpServer;
-use semdocs::plugins::graph::GraphMode;
+use semdocs::plugins::graph::{GraphMode, GraphQueryParams};
 use semdocs::query::{record_json, ExpandTo};
 use semdocs::store::InputDoc;
 use serde::Deserialize;
@@ -195,6 +195,11 @@ async fn main() -> Result<()> {
         .route("/ui", get(ui_index))
         .route("/ui/search", get(ui_search))
         .route("/ui/doc/:id", get(ui_doc))
+        .route("/ui/doc/:id/delete", post(ui_doc_delete))
+        .route("/ui/doc/:id/meta", post(ui_doc_meta))
+        .route("/ui/add", get(ui_add_form).post(ui_add_submit))
+        .route("/ui/stats", get(ui_stats))
+        .route("/ui/export", get(ui_export))
         .with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&args.listen).await?;
@@ -826,11 +831,11 @@ mod semdoc_bin_helpers {
 
 // ── Web UI ─────────────────────────────────────────────────────────
 //
-// Read-only HTML pages served from the same axum router. No external
-// assets, no template engine — format! + html_escape. Filter bar is
-// generated from the database schema ([fields]); the search box calls
-// /query/semantic + /query/text server-side and renders both result
-// sets side by side. UI is GET-only (no mutation surface).
+// HTML pages served from the same axum router. No external assets, no
+// template engine — format! + html_escape. Filter bar is generated from
+// the database schema ([fields]); the search box runs semantic/fts/graph
+// server-side. Mutations (add/edit/delete) use POST forms that redirect
+// back to the list or detail page (POST/redirect/GET).
 
 use axum::extract::Query as AxumQuery;
 
@@ -883,13 +888,58 @@ pre{{background:#fff;padding:18px;box-shadow:0 1px 3px rgba(0,0,0,.08);white-spa
 .pager button{{padding:5px 12px;background:#28c;color:#fff;border:0;border-radius:4px;cursor:pointer}}\
 .pager .disabled{{color:#bbb}}\
 h2{{font-size:16px;margin:24px 0 10px}}\
+mark{{background:#ffe58f;padding:0 1px;border-radius:2px}}\
+.kv input{{width:95%;padding:3px 6px;border:1px solid #ccc;border-radius:3px;font-size:13px}}\
+.btn{{display:inline-block;padding:7px 16px;background:#28c;color:#fff;border:0;border-radius:4px;cursor:pointer;text-decoration:none;font-size:14px}}\
+.btn.danger{{background:#c33;padding:3px 10px;font-size:12px}}\
+.del{{margin:0}}\
+.md{{background:#fff;padding:18px;box-shadow:0 1px 3px rgba(0,0,0,.08);font-size:14px;line-height:1.6;max-height:70vh;overflow:auto}}\
+.md pre{{box-shadow:none;border:1px solid #e4e4e6;max-height:none}}\
+.md code{{font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px;background:#f4f4f4;padding:1px 4px;border-radius:3px}}\
+.md pre code{{background:none;padding:0}}\
+.bar{{display:inline-block;background:#9ad;height:10px;border-radius:2px;vertical-align:middle;margin-right:8px}}\
+.muted{{color:#888;font-size:12px}}\
 </style></head><body>\
-<header><span class=\"brand\">semdoc</span><a href=\"/ui\">Documents</a><a href=\"/ui/search\">Search</a></header>\
+<header><span class=\"brand\">semdoc</span><a href=\"/ui\">Documents</a><a href=\"/ui/search\">Search</a><a href=\"/ui/stats\">Stats</a><a href=\"/ui/add\">+ Add</a></header>\
 <main>{body}</main></body></html>"
     )
 }
 
-/// GET /ui — paged parent documents with a schema-driven filter bar.
+/// Sort key for in-memory ordering: reserved `id` column or a [fields]
+/// value from `extra`.
+fn sort_key(rec: &semdocs::store::Record, field: &str) -> Value {
+    match field {
+        "id" => Value::String(rec.id.clone()),
+        other => rec.extra.get(other).cloned().unwrap_or(Value::Null),
+    }
+}
+
+/// Value comparison for sorting: numeric when both sides parse as
+/// numbers, else case-insensitive string order (NULLs sort first).
+fn cmp_values(a: &Value, b: &Value) -> std::cmp::Ordering {
+    match (a, b) {
+        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+        (Value::Null, _) => std::cmp::Ordering::Less,
+        (_, Value::Null) => std::cmp::Ordering::Greater,
+        _ => match (a.as_f64(), b.as_f64()) {
+            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+            _ => {
+                let sa = match a {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let sb = match b {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                sa.to_lowercase().cmp(&sb.to_lowercase())
+            }
+        },
+    }
+}
+
+/// GET /ui — paged parent documents with a schema-driven filter bar,
+/// sortable columns, distinct-value suggestions, export and row delete.
 async fn ui_index(
     State(state): State<Arc<AppState>>,
     AxumQuery(params): AxumQuery<std::collections::HashMap<String, String>>,
@@ -898,15 +948,38 @@ async fn ui_index(
     let size: usize = params
         .get("size")
         .and_then(|s| s.parse().ok())
-        .filter(|&n| n >= 1 && n <= 200)
+        .filter(|&n| (1..=200).contains(&n))
         .unwrap_or(20);
+    // sort=field ascending, sort=-field descending; restricted to declared
+    // [fields] plus the reserved id column.
+    let sort_raw = params.get("sort").cloned().unwrap_or_default();
+    let (sort_field, sort_desc) = sort_raw
+        .strip_prefix('-')
+        .map(|f| (f.to_string(), true))
+        .unwrap_or((sort_raw.clone(), false));
+    let sort_active = !sort_field.is_empty()
+        && (sort_field == "id" || state.mcp.engine.config.fields.contains_key(&sort_field));
 
     // Mongo-style filter compiled server-side from the query params that
-    // match declared [fields] — same DSL the API uses.
+    // match declared [fields]. A comma inside a value means OR ($in).
     let mut filter_obj = serde_json::Map::new();
     for (k, v) in &params {
         if state.mcp.engine.config.fields.contains_key(k) && !v.is_empty() {
-            filter_obj.insert(k.clone(), Value::String(v.clone()));
+            let parts: Vec<Value> = v
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| Value::String(s.to_string()))
+                .collect();
+            if parts.is_empty() {
+                continue;
+            }
+            let cond = if parts.len() > 1 {
+                json!({ "$in": parts })
+            } else {
+                parts.into_iter().next().unwrap()
+            };
+            filter_obj.insert(k.clone(), cond);
         }
     }
     let filter_sql = if filter_obj.is_empty() {
@@ -916,44 +989,135 @@ async fn ui_index(
         Some(pred.compile(&state.mcp.engine.config).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?)
     };
 
-    // Count all matching rows first — the pager shows totals and the
-    // requested page is clamped into range.
-    let total = state
+    // Distinct values per string field for filter-bar datalist
+    // suggestions (whole corpus, in-memory — fine at UI scale).
+    let all = state
         .mcp
         .engine
         .store
-        .count_parents_filtered(filter_sql.as_deref())
+        .all_parents()
         .await
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-    let total_pages = total.div_ceil(size).max(1);
-    let page = page_req.min(total_pages);
-    let offset = (page - 1) * size;
+    let mut distinct: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> =
+        std::collections::BTreeMap::new();
+    for d in &all {
+        for (name, fc) in state.mcp.engine.config.fields.iter() {
+            if fc.r#type != "string" {
+                continue;
+            }
+            if let Some(Value::String(s)) = d.extra.get(name) {
+                if !s.is_empty() {
+                    distinct.entry(name.clone()).or_default().insert(s.clone());
+                }
+            }
+        }
+    }
 
-    // List with the filter, count all matching for pagination.
-    let docs = state
-        .mcp
-        .engine
-        .store
-        .list_parents_filtered(size, offset, filter_sql.as_deref())
-        .await
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    // Fetch the page. LanceDB has no ORDER BY: an active sort pulls the
+    // full filtered set (capped) and sorts + slices in memory; otherwise
+    // the database paginates directly.
+    let (docs, total, page, total_pages) = if sort_active {
+        let mut filtered = state
+            .mcp
+            .engine
+            .store
+            .list_parents_filtered(semdocs::store::Store::ALL_PARENTS_CAP, 0, filter_sql.as_deref())
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let total = filtered.len();
+        let total_pages = total.div_ceil(size).max(1);
+        let page = page_req.min(total_pages);
+        filtered.sort_by(|a, b| {
+            let ord = cmp_values(&sort_key(a, &sort_field), &sort_key(b, &sort_field));
+            if sort_desc { ord.reverse() } else { ord }
+        });
+        let docs: Vec<_> = filtered.into_iter().skip((page - 1) * size).take(size).collect();
+        (docs, total, page, total_pages)
+    } else {
+        let total = state
+            .mcp
+            .engine
+            .store
+            .count_parents_filtered(filter_sql.as_deref())
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        let total_pages = total.div_ceil(size).max(1);
+        let page = page_req.min(total_pages);
+        let offset = (page - 1) * size;
+        let docs = state
+            .mcp
+            .engine
+            .store
+            .list_parents_filtered(size, offset, filter_sql.as_deref())
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        (docs, total, page, total_pages)
+    };
 
-    // Filter bar inputs: every string-ish field gets one input.
+    // Filter bar: every string field gets one input plus a datalist of
+    // values already present in the corpus. Comma inside a value = OR.
     let cur = |k: &str| html_escape(params.get(k).map(|s| s.as_str()).unwrap_or(""));
     let mut bar = String::from("<form class=\"filter\" method=\"get\" action=\"/ui\">");
+    let mut datalists = String::new();
     for (name, fc) in state.mcp.engine.config.fields.iter() {
         if fc.r#type == "string" {
             bar.push_str(&format!(
-                "<span><label>{}</label><br><input name=\"{}\" value=\"{}\"></span>",
+                "<span><label>{}</label><br><input name=\"{}\" list=\"dl-{}\" value=\"{}\"></span>",
+                html_escape(name),
                 html_escape(name),
                 html_escape(name),
                 cur(name)
             ));
+            let mut dl = format!("<datalist id=\"dl-{}\">", html_escape(name));
+            if let Some(vals) = distinct.get(name) {
+                for v in vals.iter().take(200) {
+                    dl.push_str(&format!("<option value=\"{}\">", html_escape(v)));
+                }
+            }
+            dl.push_str("</datalist>");
+            datalists.push_str(&dl);
         }
     }
-    bar.push_str("<span><br><button type=\"submit\">Filter</button></span></form>");
+    bar.push_str("<span><br><button type=\"submit\">Filter</button></span>\
+<span class=\"muted\" style=\"align-self:end\">comma = OR within a field</span></form>");
 
-    // Rows
+    // Query string carrying active filters (used by pager/sort/export).
+    let qs: Vec<String> = params
+        .iter()
+        .filter(|(k, _)| state.mcp.engine.config.fields.contains_key(*k) && !k.is_empty())
+        .map(|(k, v)| format!("{k}={}", url_encode(v)))
+        .collect();
+
+    // Sortable column headers: click toggles asc → desc; keeps filters
+    // and page size, resets to page 1.
+    let sort_th = |name: &str, sortable: bool| -> String {
+        if !sortable {
+            return format!("<th>{}</th>", html_escape(name));
+        }
+        let (next, arrow) = if sort_active && sort_field == name {
+            if sort_desc {
+                (name.to_string(), " ▼")
+            } else {
+                (format!("-{name}"), " ▲")
+            }
+        } else {
+            (name.to_string(), "")
+        };
+        let mut q = qs.clone();
+        q.push(format!("sort={}", url_encode(&next)));
+        q.push(format!("size={size}"));
+        format!(
+            "<th><a href=\"/ui?{}\" title=\"sort by {0}\">{0}{arrow}</a></th>",
+            q.join("&amp;")
+        )
+    };
+    let mut header = format!("<tr>{}<th>text</th>", sort_th("id", true));
+    for name in state.mcp.engine.config.fields.keys() {
+        header.push_str(&sort_th(name, true));
+    }
+    header.push_str("<th></th></tr>");
+
+    // Rows: id/text/fields + a delete form cell (confirm before POST).
     let mut rows = String::new();
     for d in &docs {
         let short_id = if d.id.len() >= 12 { &d.id[..12] } else { &d.id };
@@ -979,25 +1143,24 @@ async fn ui_index(
                 html_escape(&v)
             ));
         }
+        cells.push_str(&format!(
+            "<td><form class=\"del\" method=\"post\" action=\"/ui/doc/{}/delete\" \
+onsubmit=\"return confirm('Delete this document and all its chunks?')\">\
+<button class=\"btn danger\" type=\"submit\">✕</button></form></td>",
+            html_escape(&d.id)
+        ));
         rows.push_str(&format!("<tr>{cells}</tr>\n"));
     }
-    let mut header = String::from("<tr><th>id</th><th>text</th>");
-    for name in state.mcp.engine.config.fields.keys() {
-        header.push_str(&format!("<th>{}</th>", html_escape(name)));
-    }
-    header.push_str("</tr>");
 
-    // Pagination preserving filters: prev/next, page x / N, total count,
-    // and a jump form carrying the active filters as hidden inputs.
-    let qs: Vec<String> = params
-        .iter()
-        .filter(|(k, _)| state.mcp.engine.config.fields.contains_key(*k) && !k.is_empty())
-        .map(|(k, v)| format!("{k}={}", url_encode(v)))
-        .collect();
+    // Pagination preserving filters + sort: prev/next, page x / N, total
+    // count, jump form, and a page-size form.
     let page_nav = |p: usize, label: &str| -> String {
         let mut q = qs.clone();
         q.push(format!("page={p}"));
         q.push(format!("size={size}"));
+        if sort_active {
+            q.push(format!("sort={}", url_encode(&sort_raw)));
+        }
         format!("<a href=\"/ui?{}\">{label}</a>", q.join("&amp;"))
     };
     let prev = match page {
@@ -1017,6 +1180,12 @@ async fn ui_index(
                 html_escape(v)
             ));
         }
+    }
+    if sort_active {
+        hidden.push_str(&format!(
+            "<input type=\"hidden\" name=\"sort\" value=\"{}\">",
+            html_escape(&sort_raw)
+        ));
     }
     // Page-size options: common steps plus the current value if it is
     // off-step (e.g. hand-edited URL) so the select shows the truth.
@@ -1054,14 +1223,26 @@ async fn ui_index(
         "<p class=\"range\">Showing {shown_from}–{shown_to} of {total} documents (page {page}/{total_pages})</p>"
     );
 
+    // Export carries the active filters (not pagination/sort).
+    let export_qs = qs.join("&amp;");
+    let sep = if export_qs.is_empty() { "" } else { "&amp;" };
+    let export = format!(
+        "<p class=\"range\"><a href=\"/ui/export?format=jsonl{sep}{export_qs}\">Export JSONL</a> · \
+<a href=\"/ui/export?format=csv{sep}{export_qs}\">Export CSV</a> \
+<span class=\"muted\">(filtered set, max {})</span></p>",
+        semdocs::store::Store::ALL_PARENTS_CAP
+    );
+
     let body = format!(
-        "<h2>Documents</h2>{bar}{range}\
+        "<h2>Documents</h2>{bar}{datalists}{range}{export}\
 <table>{header}{rows}</table>{nav}"
     );
     Ok(axum::response::Html(ui_page("Documents", &body)))
 }
 
-/// GET /ui/doc/:id — full raw_text + metadata table.
+/// GET /ui/doc/:id — metadata table (schema fields editable in place),
+/// raw_text (markdown-rendered when language=markdown), child-chunk
+/// browser for parents, and a delete button.
 async fn ui_doc(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1085,10 +1266,18 @@ async fn ui_doc(
         )
     }
 
+    // Read-only pipeline columns. source_path/source_type are declared
+    // [fields] in this schema, so they render as editable inputs below.
+    let schema_keys: std::collections::HashSet<_> =
+        state.mcp.engine.config.fields.keys().cloned().collect();
     let mut rows = String::new();
     rows.push_str(&kv_row("id", &rec.id));
-    rows.push_str(&kv_row("source_path", &rec.source_path));
-    rows.push_str(&kv_row("source_type", &rec.source_type));
+    if !schema_keys.contains("source_path") {
+        rows.push_str(&kv_row("source_path", &rec.source_path));
+    }
+    if !schema_keys.contains("source_type") {
+        rows.push_str(&kv_row("source_type", &rec.source_type));
+    }
     if let Some(p) = &rec.parent_doc_id {
         rows.push_str(&format!(
             "<tr><th>parent_doc_id</th><td><a href=\"/ui/doc/{p}\">{}</a></td></tr>",
@@ -1098,25 +1287,27 @@ async fn ui_doc(
     rows.push_str(&kv_row("chunk_level", &rec.chunk_level.to_string()));
     rows.push_str(&kv_row("chunk_index", &rec.chunk_index.to_string()));
 
-    // Schema-defined [fields] in declaration order, followed by any extra
-    // runtime fields that may exist in this row.
-    let schema_keys: std::collections::HashSet<_> =
-        state.mcp.engine.config.fields.keys().cloned().collect();
+    // Editable schema fields (list<string> stays read-only — the form
+    // posts plain strings); non-schema extras render read-only.
     for (k, fc) in &state.mcp.engine.config.fields {
-        let v = rec.extra.get(k).map(|v| match v {
-            Value::String(s) => s.clone(),
-            other => other.to_string(),
-        });
-        rows.push_str(&kv_row(
-            k,
-            &v.unwrap_or_else(|| {
-                if fc.r#type == "string" {
-                    String::new()
-                } else {
-                    "null".to_string()
-                }
-            }),
-        ));
+        let cur = rec
+            .extra
+            .get(k)
+            .map(|v| match v {
+                Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .unwrap_or_default();
+        if fc.r#type == "list<string>" {
+            rows.push_str(&kv_row(k, &cur));
+        } else {
+            rows.push_str(&format!(
+                "<tr><th>{}</th><td><input name=\"{}\" value=\"{}\" form=\"metaform\"></td></tr>",
+                html_escape(k),
+                html_escape(k),
+                html_escape(&cur)
+            ));
+        }
     }
     for (k, v) in &rec.extra {
         if schema_keys.contains(k) {
@@ -1129,31 +1320,493 @@ async fn ui_doc(
         rows.push_str(&kv_row(k, &s));
     }
 
-    let meta = format!("<table class=\"kv\">{}</table>", rows);
+    let meta = format!(
+        "<table class=\"kv\">{rows}</table>\
+<form id=\"metaform\" method=\"post\" action=\"/ui/doc/{}/meta\">\
+<p><button class=\"btn\" type=\"submit\">Save metadata</button> \
+<span class=\"muted\">edits cascade to all chunks of this document</span></p></form>",
+        html_escape(&rec.id)
+    );
+
+    // Delete cascades to chunks (and to the parent when this row is a
+    // chunk — delete_doc_checked normalizes the id).
+    let actions = format!(
+        "<form class=\"del\" method=\"post\" action=\"/ui/doc/{}/delete\" \
+onsubmit=\"return confirm('Delete this document and all its chunks?')\" \
+style=\"margin-bottom:14px\">\
+<button class=\"btn danger\" type=\"submit\">Delete document</button></form>",
+        html_escape(&rec.id)
+    );
+
     let text = if rec.chunk_level == 0 && rec.raw_text.chars().count() > 40_000 {
         format!("{}\n\n… (truncated at 40k chars)", rec.raw_text.chars().take(40_000).collect::<String>())
     } else {
         rec.raw_text.clone()
     };
-    let body = format!("{meta}<pre>{}</pre>", html_escape(&text));
+    let is_markdown = rec
+        .extra
+        .get("language")
+        .and_then(|v| v.as_str())
+        .map(|l| l.eq_ignore_ascii_case("markdown"))
+        .unwrap_or(false);
+    let body_html = if is_markdown {
+        format!(
+            "<div class=\"md\">{}</div><p class=\"muted\">rendered from markdown · \
+<a href=\"/documents/{}\">raw JSON</a></p>",
+            render_markdown(&text),
+            html_escape(&rec.id)
+        )
+    } else {
+        format!("<pre>{}</pre>", html_escape(&text))
+    };
+
+    // Child-chunk browser (parent documents only).
+    let mut chunks_html = String::new();
+    if rec.chunk_level == 0 {
+        let chunks = state
+            .mcp
+            .engine
+            .store
+            .list_chunks_of(&rec.id)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        if !chunks.is_empty() {
+            let mut rows = String::new();
+            for c in &chunks {
+                rows.push_str(&format!(
+                    "<tr><td>{}</td><td title=\"{}\"><a href=\"/ui/doc/{}\">{}</a></td></tr>",
+                    c.chunk_index,
+                    html_escape(&c.raw_text.chars().take(300).collect::<String>()),
+                    html_escape(&c.id),
+                    html_escape(&c.raw_text.chars().take(120).collect::<String>())
+                ));
+            }
+            chunks_html = format!(
+                "<h2>Chunks ({})</h2><table><tr><th>#</th><th>text</th></tr>{rows}</table>",
+                chunks.len()
+            );
+        }
+    }
+
+    let body = format!("{actions}{meta}{chunks_html}{body_html}");
     Ok(axum::response::Html(ui_page("Document", &body)))
 }
 
-/// GET /ui/search?q=...&mode=semantic|fts — runs the query server-side
-/// and renders both result sets as cards.
+/// POST /ui/doc/:id/delete — cascade delete, then back to the list.
+async fn ui_doc_delete(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Redirect, (StatusCode, String)> {
+    semdocs::mcp::delete_doc_checked(&state.mcp, &id)
+        .await
+        .map_err(|e| {
+            let msg = format!("{e:#}");
+            let status = if msg.contains("not found") {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (status, msg)
+        })?;
+    Ok(Redirect::to("/ui"))
+}
+
+/// POST /ui/doc/:id/meta — in-place metadata edit. Only declared
+/// [fields] are accepted; values are coerced from form strings to the
+/// declared type; edits cascade from the parent to all its chunks.
+async fn ui_doc_meta(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Form(form): Form<std::collections::HashMap<String, String>>,
+) -> Result<Redirect, (StatusCode, String)> {
+    // Normalize to the parent so edits on a chunk row cascade correctly.
+    let rec = state
+        .mcp
+        .engine
+        .store
+        .get_by_id(&id)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
+        .ok_or_else(|| (StatusCode::NOT_FOUND, format!("document {id} not found")))?;
+    let parent_id = rec.parent_doc_id.clone().unwrap_or_else(|| rec.id.clone());
+
+    let mut updates: Vec<(String, Value)> = Vec::new();
+    for (k, fc) in &state.mcp.engine.config.fields {
+        let Some(raw) = form.get(k) else { continue };
+        let v = match fc.r#type.as_str() {
+            "int64" | "timestamp" => match raw.trim().parse::<i64>() {
+                Ok(n) => Value::from(n),
+                Err(_) if raw.trim().is_empty() => Value::Null,
+                Err(_) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!("field {k}: expected integer, got {raw:?}"),
+                    ))
+                }
+            },
+            "float32" => match raw.trim().parse::<f64>() {
+                Ok(n) => Value::from(n),
+                Err(_) if raw.trim().is_empty() => Value::Null,
+                Err(_) => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        format!("field {k}: expected number, got {raw:?}"),
+                    ))
+                }
+            },
+            "bool" => Value::Bool(matches!(raw.trim(), "true" | "1" | "on" | "yes")),
+            "list<string>" => continue, // read-only in the UI form
+            _ => Value::String(raw.clone()),
+        };
+        updates.push((k.clone(), v));
+    }
+    if !updates.is_empty() {
+        state
+            .mcp
+            .engine
+            .store
+            .update_metadata(&parent_id, &updates, true)
+            .await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+        semdocs::mcp::fire_event("update", &parent_id, json!({ "via": "ui" }));
+    }
+    Ok(Redirect::to(&format!("/ui/doc/{parent_id}")))
+}
+
+/// GET /ui/add — new-document form: raw text + one input per string
+/// [fields] entry.
+async fn ui_add_form(
+    State(state): State<Arc<AppState>>,
+) -> Result<axum::response::Html<String>, (StatusCode, String)> {
+    let mut fields_html = String::new();
+    for (name, fc) in state.mcp.engine.config.fields.iter() {
+        if fc.r#type == "string" {
+            fields_html.push_str(&format!(
+                "<span><label>{}</label><br><input name=\"{}\"></span>",
+                html_escape(name),
+                html_escape(name)
+            ));
+        }
+    }
+    let body = format!(
+        "<h2>Add document</h2>\
+<form method=\"post\" action=\"/ui/add\">\
+<p><textarea name=\"text\" rows=\"12\" required \
+placeholder=\"raw text (markdown)\" \
+style=\"width:100%;padding:10px;border:1px solid #ccc;border-radius:4px;font:14px/1.5 ui-monospace,monospace;box-sizing:border-box\"></textarea></p>\
+<div style=\"display:flex;flex-wrap:wrap;gap:10px;margin-bottom:14px\">{fields_html}</div>\
+<p><button class=\"btn\" type=\"submit\">Add document</button> \
+<label class=\"muted\"><input type=\"checkbox\" name=\"graph\" value=\"1\"> \
+also mirror into the graph KB (entity extraction, slow)</label></p></form>"
+    );
+    Ok(axum::response::Html(ui_page("Add document", &body)))
+}
+
+/// POST /ui/add — same write path as POST /documents (chunk + embed +
+/// upsert), then redirect to the new document's detail page.
+async fn ui_add_submit(
+    State(state): State<Arc<AppState>>,
+    Form(form): Form<std::collections::HashMap<String, String>>,
+) -> Result<Redirect, (StatusCode, String)> {
+    let text = form.get("text").cloned().unwrap_or_default();
+    if text.trim().is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "text is required".into()));
+    }
+    // Unfilled string fields become "" (not absent): legacy schemas mark
+    // every column non-null, so a missing key would fail the Lance write.
+    let mut extra: serde_json::Map<String, Value> = serde_json::Map::new();
+    for (k, fc) in &state.mcp.engine.config.fields {
+        if fc.r#type == "string" {
+            extra.insert(
+                k.clone(),
+                Value::String(form.get(k).cloned().unwrap_or_default()),
+            );
+        } else if let Some(v) = form.get(k) {
+            if !v.is_empty() {
+                extra.insert(k.clone(), Value::String(v.clone()));
+            }
+        }
+    }
+    if extra
+        .get("source_path")
+        .and_then(|v| v.as_str())
+        .map(|s| s.is_empty())
+        .unwrap_or(false)
+    {
+        extra.insert("source_path".to_string(), Value::String("inline".into()));
+    }
+    if extra
+        .get("source_type")
+        .and_then(|v| v.as_str())
+        .map(|s| s.is_empty())
+        .unwrap_or(false)
+    {
+        extra.insert("source_type".to_string(), Value::String("text".into()));
+    }
+    let id = blake3::hash(text.as_bytes()).to_hex().to_string();
+    let doc = InputDoc {
+        id: id.clone(),
+        raw_text: text.clone(),
+        source_path: "inline".into(),
+        source_type: "text".into(),
+        language: Some("markdown".into()),
+        extra,
+        vectors: Default::default(),
+    };
+    semdoc_bin_helpers::write_doc(&state.mcp.engine.store, &state.mcp.engine.embedder, doc)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    semdocs::mcp::fire_event("add", &id, json!({ "via": "ui" }));
+    // Graph mirror is opt-in and never fails the write (LanceDB is the
+    // source of truth; entity extraction degrades loudly).
+    if form.contains_key("graph") {
+        if let Err(e) = state.mcp.graph.insert(vec![(text, id.clone())]).await {
+            eprintln!("[graph] insert degraded: {e:#}");
+        }
+    }
+    Ok(Redirect::to(&format!("/ui/doc/{id}")))
+}
+
+/// GET /ui/stats — corpus overview: totals plus per-field value
+/// distributions (in-memory over all parents, capped at ALL_PARENTS_CAP).
+async fn ui_stats(
+    State(state): State<Arc<AppState>>,
+) -> Result<axum::response::Html<String>, (StatusCode, String)> {
+    let parents = state
+        .mcp
+        .engine
+        .store
+        .count_parents_filtered(None)
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let rows_total = state
+        .mcp
+        .engine
+        .store
+        .count()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let all = state
+        .mcp
+        .engine
+        .store
+        .all_parents()
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    let mut body = format!(
+        "<h2>Stats</h2><table class=\"kv\">\
+<tr><th>documents (parents)</th><td>{parents}</td></tr>\
+<tr><th>chunks (leaves)</th><td>{}</td></tr>\
+<tr><th>total rows</th><td>{rows_total}</td></tr></table>",
+        rows_total.saturating_sub(parents)
+    );
+
+    // Per-field distribution: value → count, sorted desc, top 20 with a
+    // proportional bar; each value links to the filtered list.
+    for (name, fc) in state.mcp.engine.config.fields.iter() {
+        if fc.r#type != "string" {
+            continue;
+        }
+        let mut counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for d in &all {
+            if let Some(Value::String(s)) = d.extra.get(name) {
+                if !s.is_empty() {
+                    *counts.entry(s.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+        if counts.is_empty() {
+            continue;
+        }
+        let mut sorted: Vec<(String, usize)> = counts.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        let max = sorted.first().map(|x| x.1).unwrap_or(1);
+        let total_vals = sorted.len();
+        let mut rows = String::new();
+        for (v, n) in sorted.into_iter().take(20) {
+            let width = (n * 200 / max.max(1)).max(2);
+            rows.push_str(&format!(
+                "<tr><td><a href=\"/ui?{}={}\">{}</a></td><td>{n}</td>\
+<td><span class=\"bar\" style=\"width:{width}px\"></span></td></tr>",
+                url_encode(name),
+                url_encode(&v),
+                html_escape(&v)
+            ));
+        }
+        if total_vals > 20 {
+            rows.push_str(&format!(
+                "<tr><td class=\"muted\">… {} more values</td><td></td><td></td></tr>",
+                total_vals - 20
+            ));
+        }
+        body.push_str(&format!(
+            "<h2>{} <span class=\"muted\">{total_vals} distinct</span></h2>\
+<table><tr><th>value</th><th>docs</th><th></th></tr>{rows}</table>",
+            html_escape(name)
+        ));
+    }
+    Ok(axum::response::Html(ui_page("Stats", &body)))
+}
+
+/// GET /ui/export?format=jsonl|csv — download the filtered parent set
+/// (same filter semantics as /ui, capped at ALL_PARENTS_CAP).
+async fn ui_export(
+    State(state): State<Arc<AppState>>,
+    AxumQuery(params): AxumQuery<std::collections::HashMap<String, String>>,
+) -> Result<Response, (StatusCode, String)> {
+    let csv = params.get("format").map(|f| f == "csv").unwrap_or(false);
+
+    // Same filter compilation as ui_index (comma = OR).
+    let mut filter_obj = serde_json::Map::new();
+    for (k, v) in &params {
+        if state.mcp.engine.config.fields.contains_key(k) && !v.is_empty() {
+            let parts: Vec<Value> = v
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .map(|s| Value::String(s.to_string()))
+                .collect();
+            if parts.is_empty() {
+                continue;
+            }
+            let cond = if parts.len() > 1 {
+                json!({ "$in": parts })
+            } else {
+                parts.into_iter().next().unwrap()
+            };
+            filter_obj.insert(k.clone(), cond);
+        }
+    }
+    let filter_sql = if filter_obj.is_empty() {
+        None
+    } else {
+        let pred = semdocs::query::Pred::from_json(&Value::Object(filter_obj))
+            .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+        Some(
+            pred.compile(&state.mcp.engine.config)
+                .map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?,
+        )
+    };
+    let docs = state
+        .mcp
+        .engine
+        .store
+        .list_parents_filtered(semdocs::store::Store::ALL_PARENTS_CAP, 0, filter_sql.as_deref())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+
+    if csv {
+        fn csv_cell(s: &str) -> String {
+            let flat = s.replace(['\n', '\r'], " ");
+            if flat.contains([',', '"']) {
+                format!("\"{}\"", flat.replace('"', "\"\""))
+            } else {
+                flat
+            }
+        }
+        let mut out = String::from("id,text");
+        let field_names: Vec<&String> = state.mcp.engine.config.fields.keys().collect();
+        for n in &field_names {
+            out.push(',');
+            out.push_str(&csv_cell(n));
+        }
+        out.push('\n');
+        for d in &docs {
+            out.push_str(&csv_cell(&d.id));
+            out.push(',');
+            out.push_str(&csv_cell(&d.raw_text));
+            for n in &field_names {
+                out.push(',');
+                let v = d
+                    .extra
+                    .get(*n)
+                    .map(|v| match v {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    })
+                    .unwrap_or_default();
+                out.push_str(&csv_cell(&v));
+            }
+            out.push('\n');
+        }
+        Ok((
+            [
+                (axum::http::header::CONTENT_TYPE, "text/csv; charset=utf-8"),
+                (
+                    axum::http::header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"semdoc-documents.csv\"",
+                ),
+            ],
+            out,
+        )
+            .into_response())
+    } else {
+        let mut out = String::new();
+        for d in &docs {
+            let mut obj = serde_json::Map::new();
+            obj.insert("id".into(), Value::String(d.id.clone()));
+            obj.insert("raw_text".into(), Value::String(d.raw_text.clone()));
+            obj.insert("chunk_level".into(), d.chunk_level.into());
+            obj.insert("chunk_index".into(), d.chunk_index.into());
+            obj.insert(
+                "parent_doc_id".into(),
+                d.parent_doc_id.clone().map(Value::String).unwrap_or(Value::Null),
+            );
+            for (k, v) in &d.extra {
+                obj.insert(k.clone(), v.clone());
+            }
+            out.push_str(&Value::Object(obj).to_string());
+            out.push('\n');
+        }
+        Ok((
+            [
+                (axum::http::header::CONTENT_TYPE, "application/x-ndjson; charset=utf-8"),
+                (
+                    axum::http::header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"semdoc-documents.jsonl\"",
+                ),
+            ],
+            out,
+        )
+            .into_response())
+    }
+}
+
+/// GET /ui/search?q=...&graph=1 — semantic + FTS in parallel, optional
+/// graph column (data mode, slow); matched query words are highlighted.
 async fn ui_search(
     State(state): State<Arc<AppState>>,
     AxumQuery(params): AxumQuery<std::collections::HashMap<String, String>>,
 ) -> Result<axum::response::Html<String>, (StatusCode, String)> {
     let q = params.get("q").cloned().unwrap_or_default();
-    let mut body = "<form class=\"filter\" method=\"get\" action=\"/ui/search\">\
-<span><label>query</label><br><input class=\"q\" name=\"q\" value=\"Q\"></span>\
-<span><br><button class=\"searchbtn\" type=\"submit\">Search</button></span></form>"
-            .replace("Q", &html_escape(&q));
+    let with_graph = params.contains_key("graph");
+    let graph_checked = if with_graph { " checked" } else { "" };
+    let mut body = format!(
+        "<form class=\"filter\" method=\"get\" action=\"/ui/search\">\
+<span><label>query</label><br><input class=\"q\" name=\"q\" value=\"{}\"></span>\
+<span><br><button class=\"searchbtn\" type=\"submit\">Search</button></span>\
+<span class=\"muted\" style=\"align-self:end\"><label>\
+<input type=\"checkbox\" name=\"graph\" value=\"1\"{graph_checked}> graph (slow, ~9s)\
+</label></span></form>",
+        html_escape(&q)
+    );
     if q.trim().is_empty() {
         body.push_str("<p style=\"color:#888\">Type a query — semantic and full-text results render side by side.</p>");
         return Ok(axum::response::Html(ui_page("Search", &body)));
     }
+
+    // Highlight words: the whole query plus its whitespace-split parts,
+    // longest first so phrases win over their components.
+    let mut words: Vec<String> = q
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .chain(std::iter::once(q.trim().to_string()))
+        .collect();
+    words.retain(|w| !w.is_empty());
+    words.sort_by_key(|w| std::cmp::Reverse(w.len()));
+    words.dedup();
 
     let render_hits = |title: &str, docs: &[semdocs::store::Record]| -> String {
         let mut s = format!("<h2>{title}</h2>");
@@ -1161,34 +1814,96 @@ async fn ui_search(
             s.push_str("<p style=\"color:#888\">no results</p>");
             return s;
         }
-        s.push_str("<table><tr><th>score-doc</th><th>text</th></tr>");
+        s.push_str("<table><tr><th>doc</th><th>text</th></tr>");
         for d in docs {
             let pid = d.parent_doc_id.clone().unwrap_or_else(|| d.id.clone());
+            let snippet = html_escape(&d.raw_text.chars().take(200).collect::<String>());
             s.push_str(&format!(
                 "<tr><td><a href=\"/ui/doc/{pid}\">{}</a></td><td>{}</td></tr>",
                 html_escape(&pid[..12.min(pid.len())]),
-                html_escape(&d.raw_text.chars().take(160).collect::<String>())
+                highlight(&snippet, &words)
             ));
         }
         s.push_str("</table>");
         s
     };
 
-    let semantic = state
-        .mcp
-        .engine
-        .query_semantic(&q, 10, None, ExpandTo::Chunk)
-        .await
-        .unwrap_or_default();
-    body.push_str(&render_hits("Semantic", &semantic));
-    let fts = state
-        .mcp
-        .engine
-        .query_fts(&q, 10, None)
-        .await
-        .unwrap_or_default();
-    body.push_str(&render_hits("Full-text", &fts));
+    // Atomic backends run in parallel; the graph column is opt-in
+    // because lightrag data-mode takes ~9s.
+    let (semantic, fts) = tokio::join!(
+        state.mcp.engine.query_semantic(&q, 10, None, ExpandTo::Chunk),
+        state.mcp.engine.query_fts(&q, 10, None)
+    );
+    body.push_str(&render_hits("Semantic", &semantic.unwrap_or_default()));
+    body.push_str(&render_hits("Full-text", &fts.unwrap_or_default()));
+
+    if with_graph {
+        body.push_str("<h2>Graph</h2>");
+        match state
+            .mcp
+            .graph
+            .query(&q, GraphMode::Data, 10, &GraphQueryParams::default())
+            .await
+        {
+            Ok(ans) => {
+                if ans.degraded {
+                    body.push_str("<p class=\"muted\">graph backend degraded — showing fallback</p>");
+                }
+                let snippet: String = ans.content.chars().take(4000).collect();
+                body.push_str(&format!("<pre>{}</pre>", html_escape(&snippet)));
+            }
+            Err(e) => {
+                body.push_str(&format!(
+                    "<p style=\"color:#c33\">graph query failed: {}</p>",
+                    html_escape(&format!("{e:#}"))
+                ));
+            }
+        }
+    }
     Ok(axum::response::Html(ui_page("Search", &body)))
+}
+
+/// Wrap occurrences of each query word in <mark>. The input is already
+/// HTML-escaped; matching is case-insensitive. Slicing is guarded so
+/// non-UTF-8-boundary hits (from lowercase length changes) skip safely.
+fn highlight(escaped: &str, words: &[String]) -> String {
+    let mut out = escaped.to_string();
+    for w in words {
+        let we = html_escape(w);
+        if we.is_empty() {
+            continue;
+        }
+        let wl = we.to_lowercase();
+        let mut result = String::with_capacity(out.len() + 64);
+        let mut i = 0usize;
+        loop {
+            let Some(pos) = out[i..].to_lowercase().find(&wl) else {
+                break;
+            };
+            let abs = i + pos;
+            let Some(matched) = out.get(abs..abs + we.len()) else {
+                break;
+            };
+            result.push_str(&out[i..abs]);
+            result.push_str("<mark>");
+            result.push_str(matched);
+            result.push_str("</mark>");
+            i = abs + we.len();
+        }
+        result.push_str(&out[i..]);
+        out = result;
+    }
+    out
+}
+
+/// Render markdown to HTML with inline HTML neutralized: pre-escaping
+/// keeps pulldown-cmark from passing <script> etc. straight through.
+fn render_markdown(text: &str) -> String {
+    let escaped = html_escape(text);
+    let parser = pulldown_cmark::Parser::new(&escaped);
+    let mut out = String::new();
+    pulldown_cmark::html::push_html(&mut out, parser);
+    out
 }
 
 fn url_encode(s: &str) -> String {

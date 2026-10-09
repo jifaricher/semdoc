@@ -38,6 +38,7 @@ hmac = "0.12"
 sha2 = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 
 [features]
 # default is the lightweight http-embedder build — `cargo install` stays

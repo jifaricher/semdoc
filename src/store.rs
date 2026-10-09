@@ -596,6 +596,22 @@ impl Store {
         Ok(recs)
     }
 
+    /// All leaf chunks of a parent document, sorted by chunk_index —
+    /// drives the UI detail page chunk browser.
+    pub async fn list_chunks_of(&self, parent_doc_id: &str) -> Result<Vec<Record>> {
+        let t = self.conn.open_table(&self.table).execute().await?;
+        let pid = parent_doc_id.replace('\'', "''");
+        let results = t
+            .query()
+            .only_if(format!("chunk_level = 1 AND parent_doc_id = '{pid}'"))
+            .limit(10_000)
+            .execute()
+            .await?;
+        let mut recs = records_from_stream(results, &self.scalar_fields).await?;
+        recs.sort_by_key(|r| r.chunk_index);
+        Ok(recs)
+    }
+
     pub async fn count(&self) -> Result<usize> {
         let t = self.conn.open_table(&self.table).execute().await?;
         Ok(t.count_rows(None).await?)
