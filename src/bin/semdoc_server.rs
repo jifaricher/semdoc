@@ -865,6 +865,8 @@ main{{padding:24px;max-width:1200px;margin:0 auto}}\
 table{{border-collapse:collapse;width:100%;table-layout:fixed;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.08)}}\
 th,td{{border:1px solid #e4e4e6;padding:6px 8px;text-align:left;vertical-align:top;font-size:13px}}\
 th{{background:#eeeef0}}\
+th a{{color:inherit;text-decoration:none;border-bottom:1px dashed #aab}}\
+th a:hover{{color:#28c}}\
 td{{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}\
 .kv td{{white-space:normal;word-break:break-word}}\
 td:first-child{{font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px}}\
@@ -873,8 +875,12 @@ tr:hover td{{background:#f0f4ff}}\
 a{{color:#28c}}\
 form.filter{{background:#fff;padding:14px;box-shadow:0 1px 3px rgba(0,0,0,.08);margin-bottom:18px;display:flex;flex-wrap:wrap;gap:10px;align-items:end}}\
 form.filter label{{font-size:12px;color:#666;display:block}}\
-form.filter input{{padding:6px 8px;border:1px solid #ccc;border-radius:4px;width:150px}}\
+form.filter label.inline{{display:inline;font-size:13px}}\
+form.filter input:not([type=checkbox]){{padding:6px 8px;border:1px solid #ccc;border-radius:4px;width:150px}}\
 form.filter button,.searchbtn{{padding:7px 16px;background:#28c;color:#fff;border:0;border-radius:4px;cursor:pointer}}\
+.fields{{display:flex;flex-wrap:wrap;gap:10px;margin-bottom:14px}}\
+.fields label{{font-size:12px;color:#666;display:block}}\
+.fields input{{padding:6px 8px;border:1px solid #ccc;border-radius:4px;width:180px}}\
 input.q{{width:320px}}\
 pre{{background:#fff;padding:18px;box-shadow:0 1px 3px rgba(0,0,0,.08);white-space:pre-wrap;word-break:break-word;font-size:14px;line-height:1.6;max-height:70vh;overflow:auto}}\
 .meta{{background:#fff;padding:12px 18px;box-shadow:0 1px 3px rgba(0,0,0,.08);margin-bottom:14px;font-size:13px}}\
@@ -1107,8 +1113,11 @@ async fn ui_index(
         q.push(format!("sort={}", url_encode(&next)));
         q.push(format!("size={size}"));
         format!(
-            "<th><a href=\"/ui?{}\" title=\"sort by {0}\">{0}{arrow}</a></th>",
-            q.join("&amp;")
+            "<th><a href=\"/ui?{}\" title=\"sort by {}\">{}{}</a></th>",
+            q.join("&amp;"),
+            html_escape(name),
+            html_escape(name),
+            arrow
         )
     };
     let mut header = format!("<tr>{}<th>text</th>", sort_th("id", true));
@@ -1494,7 +1503,7 @@ async fn ui_add_form(
 <p><textarea name=\"text\" rows=\"12\" required \
 placeholder=\"raw text (markdown)\" \
 style=\"width:100%;padding:10px;border:1px solid #ccc;border-radius:4px;font:14px/1.5 ui-monospace,monospace;box-sizing:border-box\"></textarea></p>\
-<div style=\"display:flex;flex-wrap:wrap;gap:10px;margin-bottom:14px\">{fields_html}</div>\
+<div class=\"fields\">{fields_html}</div>\
 <p><button class=\"btn\" type=\"submit\">Add document</button> \
 <label class=\"muted\"><input type=\"checkbox\" name=\"graph\" value=\"1\"> \
 also mirror into the graph KB (entity extraction, slow)</label></p></form>"
@@ -1787,7 +1796,7 @@ async fn ui_search(
         "<form class=\"filter\" method=\"get\" action=\"/ui/search\">\
 <span><label>query</label><br><input class=\"q\" name=\"q\" value=\"{}\"></span>\
 <span><br><button class=\"searchbtn\" type=\"submit\">Search</button></span>\
-<span class=\"muted\" style=\"align-self:end\"><label>\
+<span style=\"align-self:end;padding-bottom:8px\"><label class=\"inline muted\">\
 <input type=\"checkbox\" name=\"graph\" value=\"1\"{graph_checked}> graph (slow, ~9s)\
 </label></span></form>",
         html_escape(&q)
