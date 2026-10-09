@@ -10,6 +10,8 @@ semdoc 是 semrag 的第二版：一个通用向量知识库，**schema 是配�
 | `Config.toml` | 部署事实：embedder/reranker 端点、chunk 大小、监听地址、TLS | 否（跟着环境走） |
 | `lightrag.toml` | lightrag-server 进程配置：存储后端、LLM/Embedding/Rerank 绑定 | 否（独立解耦） |
 
+`Config.toml` / `schema.toml` 的注释为英文（面向开源用户）；中文对照参考见 `Config_ZH.toml` / `schema_ZH.toml`（仅供参考，以英文版为准）。
+
 优先级：CLI flag > 环境变量（`SEMDOC_*`）> `Config.toml` > 内置默认。密钥永不落盘：配置里只写 `*_env`（环境变量名），值本身放环境变量。
 
 ## 三种接口

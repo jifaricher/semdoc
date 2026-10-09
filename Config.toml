@@ -1,89 +1,98 @@
 # =============================================================================
-# semdoc 部署配置(Config.toml)
+# semdoc deployment configuration (Config.toml)
 # =============================================================================
-# 本文件只包含部署事实——跟环境走,不随库迁移:
+# This file holds deployment facts only — it follows the environment and
+# does NOT travel with the database:
 #
-#   [embedding]  嵌入后端(endpoint/model)
-#   [rerank]     重排后端(endpoint/model)
-#   [chunk]      分块参数
-#   [server]     HTTP server 监听与鉴权
-#   [tls]        出站 HTTPS 证书策略
+#   [embedding]  embedding backend (endpoint/model)
+#   [rerank]     rerank backend (endpoint/model)
+#   [chunk]      chunking parameters
+#   [server]     HTTP server listen address and auth
+#   [tls]        outbound HTTPS certificate policy
 #
-# 库语义([table]/[vector]/[fields]/[plugins.graph])全部放在 schema.toml,
-# `semdoc init` 时拷贝进 <db>/schema.toml,之后以库内那份为准。
-# 若本文件误写 schema 节,加载时会逐条点名警告(运行时不生效)。
+# Library semantics ([table]/[vector]/[fields]/[plugins.graph]) all live in
+# schema.toml, copied to <db>/schema.toml by `semdoc init`; afterwards the
+# in-database copy is authoritative. If schema sections are mistakenly
+# written here, the loader names each one in a startup warning (they have
+# no runtime effect).
 #
-# 查找顺序: --config <path> > $SEMDOC_CONFIG > ./Config.toml > 默认值+env
-# 优先级:   CLI flag > 环境变量 > 本文件 > 内置默认
-# 密钥:     本文件只写 *_env(环境变量名),值本身放环境变量
+# Lookup order: --config <path> > $SEMDOC_CONFIG > ./Config.toml > defaults+env
+# Priority:     CLI flag > environment variables > this file > built-in defaults
+# Secrets:      write only *_env (the NAME of an env var) here; the value
+#               itself stays in the environment
+#
+# 中文参考版: Config_ZH.toml(仅供参考,以本文件为准)
 # =============================================================================
 
 # ---------------------------------------------------------------------------
-# 嵌入后端。backend: "http"(OpenAI 兼容 /v1/embeddings) | "onnx"(需 feature)
+# Embedding backend. backend: "http" (OpenAI-compatible /v1/embeddings)
+#                             | "onnx" (requires the `onnx` feature)
 # ---------------------------------------------------------------------------
 [embedding]
 backend = "http"
-# http: endpoint(含 /v1),必填
+# http: endpoint (including /v1), required
 url = "http://192.168.1.7:11434/v1"
-# http: 模型名,必填
+# http: model name, required
 model = "bge-m3"
-# 密钥的环境变量名(可选)
+# Env var NAME holding the API key (optional)
 # api_key_env = "MY_EMBEDDER_KEY"
-# 请求超时秒数
-# 默认: 60
+# Request timeout in seconds
+# Default: 60
 # timeout_secs = 60
-# onnx 专用:模型目录
-# 默认: ~/.cache/semdoc/models/bge-m3
+# onnx only: model directory
+# Default: ~/.cache/semdoc/models/bge-m3
 # dir = "~/.cache/semdoc/models/bge-m3"
 
 # ---------------------------------------------------------------------------
-# rerank 后端。backend: "tei" | "openai" | "onnx"(需 feature) | "none"(禁用)
-# rerank 的唯一事实源就是本节(schema.toml 不声明 rerank)。
+# Rerank backend. backend: "tei" | "openai" | "onnx" (requires the `onnx`
+# feature) | "none" (disabled). This section is the ONLY source of truth
+# for rerank (schema.toml declares nothing about it).
 # ---------------------------------------------------------------------------
 [rerank]
 backend = "tei"
-# tei/openai: endpoint(openai 需含 /v1),必填
+# tei/openai: endpoint (openai must include /v1), required
 endpoint = "http://192.168.1.7:8000"
 # api_key_env = "MY_TEI_KEY"
-# 请求超时秒数
-# 默认: 120
+# Request timeout in seconds
+# Default: 120
 # timeout_secs = 120
-# openai 专用:模型名(可选)
+# openai only: model name (optional)
 # model = "bge-reranker-v2-m3"
-# onnx 专用:
-# 默认: ~/.cache/semdoc/models/bge-reranker-v2-m3
+# onnx only:
+# Default: ~/.cache/semdoc/models/bge-reranker-v2-m3
 # dir = "~/.cache/semdoc/models/bge-reranker-v2-m3"
 
 # ---------------------------------------------------------------------------
-# 分块参数(写入时生效)
+# Chunking parameters (applied at write time)
 # ---------------------------------------------------------------------------
 [chunk]
-# 目标块大小(Unicode 字符),范围 [64, 8192]
-# 默认: 512
+# Target chunk size in Unicode chars, range [64, 8192]
+# Default: 512
 size = 512
-# 相邻块重叠字符数(约 size 的 10%)
-# 默认: 50
+# Overlap between adjacent chunks (~10% of size)
+# Default: 50
 overlap = 50
 
 # ---------------------------------------------------------------------------
-# HTTP server 参数(semdoc-server 读取)
+# HTTP server parameters (read by semdoc-server)
 # ---------------------------------------------------------------------------
 [server]
-# 监听地址
-# 默认: "127.0.0.1:8092"(CLI --listen 可覆盖)
+# Listen address
+# Default: "127.0.0.1:8092" (CLI --listen overrides)
 listen = "127.0.0.1:8092"
-# Bearer token 的环境变量名;不写 = 不鉴权
+# Env var NAME holding the Bearer token; unset = no auth
 # token_env = "SEMDOC_SERVER_TOKEN"
 
 # ---------------------------------------------------------------------------
 # TLS
 # ---------------------------------------------------------------------------
 [tls]
-# 接受自签证书(内网自建 endpoint 用)。
-# 默认: false。注意:开启后所有出站 HTTPS 的证书验证被完全禁用,
-# Bearer 密钥可能被中间人截获——优先使用 ca_bundle。
+# Accept invalid certs (self-signed endpoints on internal networks).
+# Default: false. WARNING: this disables certificate verification for ALL
+# outbound HTTPS — Bearer tokens become interceptable. Prefer ca_bundle.
 insecure = false
-# 公司内部 CA 证书(PEM 格式,可含多张):加进信任链但保留其余验证。
-# 例: ca_bundle = "/etc/semdoc/company-ca.pem"
-# 默认: 不设置(只用系统证书库)
+# Company-internal CA certificate(s) in PEM format (may contain several):
+# added to the trust chain while keeping all other verification.
+# Example: ca_bundle = "/etc/semdoc/company-ca.pem"
+# Default: unset (system certificate store only)
 # ca_bundle = ""

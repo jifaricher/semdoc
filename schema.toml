@@ -1,60 +1,70 @@
 # =============================================================================
-# semdoc schema 模板(库语义)
+# semdoc schema template (library semantics)
 # =============================================================================
-# 用法: semdoc init --schema schema.toml --db <db路径>
-#       init 时本文件被拷贝为 <db>/schema.toml,之后库结构以此为准。
+# Usage: semdoc init --schema schema.toml --db <db-path>
+#        At init time this file is copied to <db>/schema.toml; afterwards
+#        the in-database copy is authoritative.
 #
-# 本文件展示 schema.toml 的"最小默认形态":只有 [table] + 单个默认向量列。
-# [fields]/[plugins] 全部是可选的——不需要就不写。
+# This file shows the "minimal default shape" of a schema.toml: just
+# [table] + a single default vector column. [fields]/[plugins] are all
+# optional — omit what you don't need.
 #
-# 注意: 空的 schema.toml(0 字节)也合法,等价于本文件取消所有注释后的形态:
-#   表名 "documents" + 单向量列 dense_vec(dim=默认 embedder 维度)
+# Note: an empty schema.toml (0 bytes) is also valid, equivalent to this
+# file with every optional section removed:
+#   table "documents" + one vector column dense_vec (dim = default
+#   embedder dimension)
+#
+# 中文参考版: schema_ZH.toml(仅供参考,以本文件为准)
 # =============================================================================
 
 [table]
-# LanceDB 表名(每库一表)
-# 默认: "documents"
+# LanceDB table name (one table per database)
+# Default: "documents"
 name = "documents"
 
 # ---------------------------------------------------------------------------
-# 向量列。未写 [[vector.fields]] 时自动派生默认单列(即下面这段的值):
-#   name="dense_vec", dim=默认 embedder 维度(init 时探测,通常 1024),
-#   source="raw_text", metric="cosine", index="none", auto_embed=true
-# 显式写出即为覆盖默认;支持多列(多路检索),每列一段 [[vector.fields]]。
+# Vector columns. With no [[vector.fields]] at all, one default column is
+# derived (exactly the values below):
+#   name="dense_vec", dim=default embedder dimension (probed at init,
+#   usually 1024), source="raw_text", metric="cosine", index="none",
+#   auto_embed=true
+# Writing the section out explicitly overrides the default; multiple
+# columns (multi-way retrieval) are supported, one [[vector.fields]]
+# section per column.
 # ---------------------------------------------------------------------------
 [[vector.fields]]
 name = "dense_vec"
-# 默认: init 时从配置的 embedder 探测(bge-m3 = 1024)
+# Default: probed from the configured embedder at init (bge-m3 = 1024)
 dim = 1024
-# 默认: "raw_text"
+# Default: "raw_text"
 source = "raw_text"
-# 可选: "cosine"(默认) | "l2" | "dot"
+# Choices: "cosine" (default) | "l2" | "dot"
 metric = "cosine"
-# 可选: "none"(默认) | "ivf_pq" | "ivf_flat"
+# Choices: "none" (default) | "ivf_pq" | "ivf_flat"
 index = "none"
-# 默认: true(false = 只接受客户端预嵌入)
+# Default: true (false = only client-pre-embedded writes are accepted)
 auto_embed = true
 
 # ---------------------------------------------------------------------------
-# 用户自定义标量字段(可选)。示例:
+# User-defined scalar fields (optional). Examples:
 # [fields]
-# domain   = { type = "string",  index = true }   # index 默认 false
+# domain   = { type = "string",  index = true }   # index defaults to false
 # priority = { type = "int64",   index = true }
 # verified = { type = "bool" }
-# tags     = { type = "list<string>" }            # $in/$nin 成员过滤
-# notes    = { type = "text" }                    # FTS 检索 / 可作向量 source
-# score    = { type = "float32", required = true } # required 默认 false
-# 保留列(不可占用): id, raw_text, chunk_level, chunk_index,
-#                    parent_doc_id, source_path, source_type
+# tags     = { type = "list<string>" }            # $in/$nin membership filters
+# notes    = { type = "text" }                    # FTS search / vector source
+# score    = { type = "float32", required = true } # required defaults to false
+# Reserved columns (may not be redeclared): id, raw_text, chunk_level,
+#                    chunk_index, parent_doc_id
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
-# 图检索插件(可选)。不写 = 禁用。
+# Graph retrieval plugin (optional). Omit = disabled.
 # ---------------------------------------------------------------------------
 # [plugins.graph]
-# backend = "lightrag-server"        # "lightrag-server" | "lightrag-embedded"(需 feature)
-# endpoint = "http://127.0.0.1:9727" # lightrag-server 必填
-# api_key_env = "LIGHTRAG_API_KEY"   # 可选
-# query_timeout_secs = 60            # 默认: 60
-# insert_concurrency = 4             # 默认: 4
-# workspace = "./rag_storage"        # lightrag-embedded 专用
+# backend = "lightrag-server"        # "lightrag-server" | "lightrag-embedded" (requires feature)
+# endpoint = "http://127.0.0.1:9727" # required for lightrag-server
+# api_key_env = "LIGHTRAG_API_KEY"   # optional
+# query_timeout_secs = 60            # default: 60
+# insert_concurrency = 4             # default: 4
+# workspace = "./rag_storage"        # lightrag-embedded only

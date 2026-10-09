@@ -128,6 +128,8 @@ Two files, two lifecycles — never merged:
 | `schema.toml` | **Library semantics**: `[table]`, `[vector]`, `[fields]`, `[plugins.graph]` | **Yes** — copied to `<db>/schema.toml` at `init`, that copy wins |
 | `Config.toml` | **Deployment facts**: `[embedding]`, `[rerank]`, `[chunk]`, `[server]`, `[tls]` | No — follows the environment |
 
+中文参考版：`Config_ZH.toml` / `schema_ZH.toml`（不会被加载，以英文版为准）。
+
 Each concern has exactly one source of truth:
 
 - **rerank** lives only in `Config.toml [rerank]` (pure query-time
