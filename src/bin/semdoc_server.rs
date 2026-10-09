@@ -1652,7 +1652,7 @@ async fn ui_stats(
         }
         body.push_str(&format!(
             "<h2>{} <span class=\"muted\">{total_vals} distinct</span></h2>\
-<table><tr><th>value</th><th>docs</th><th></th></tr>{rows}</table>",
+<table><tr><th>value</th><th>docs</th><th>dist</th></tr>{rows}</table>",
             html_escape(name)
         ));
     }
