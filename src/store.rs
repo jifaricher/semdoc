@@ -558,6 +558,17 @@ impl Store {
         records_from_stream(results, &self.scalar_fields).await
     }
 
+    /// Row count matching `list_parents_filtered` — drives the UI pager
+    /// (total documents / total pages).
+    pub async fn count_parents_filtered(&self, filter_sql: Option<&str>) -> Result<usize> {
+        let t = self.conn.open_table(&self.table).execute().await?;
+        let pred = match filter_sql {
+            Some(f) => format!("chunk_level = 0 AND {f}"),
+            None => "chunk_level = 0".to_string(),
+        };
+        Ok(t.count_rows(Some(pred)).await?)
+    }
+
     /// Sibling chunks sharing a parent, sorted by chunk_index, excluding the
     /// hit itself — used by the `auto` sentence-window expansion.
     pub async fn get_sibling_chunks(

@@ -857,20 +857,31 @@ header{{background:#1a1a2e;color:#fff;padding:14px 24px;display:flex;gap:24px;al
 header a{{color:#9ad;font-size:15px;text-decoration:none}}\
 header .brand{{font-weight:700;font-size:17px;color:#fff}}\
 main{{padding:24px;max-width:1200px;margin:0 auto}}\
-table{{border-collapse:collapse;width:100%%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.08)}}\
-th{{background:#eeeef0;text-align:left;padding:8px 10px;font-size:13px}}\
-td{{padding:8px 10px;border-top:1px solid #e4e4e6;font-size:14px;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}}\
+table{{border-collapse:collapse;width:100%;table-layout:fixed;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.08)}}\
+th,td{{border:1px solid #e4e4e6;padding:6px 8px;text-align:left;vertical-align:top;font-size:13px}}\
+th{{background:#eeeef0}}\
+td{{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}}\
+.kv td{{white-space:normal;word-break:break-word}}\
+td:first-child{{font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px}}\
 tr:hover td{{background:#f0f4ff}}\
+.kv th{{width:11em;background:#f4f4f4}}\
 a{{color:#28c}}\
 form.filter{{background:#fff;padding:14px;box-shadow:0 1px 3px rgba(0,0,0,.08);margin-bottom:18px;display:flex;flex-wrap:wrap;gap:10px;align-items:end}}\
 form.filter label{{font-size:12px;color:#666;display:block}}\
 form.filter input{{padding:6px 8px;border:1px solid #ccc;border-radius:4px;width:150px}}\
 form.filter button,.searchbtn{{padding:7px 16px;background:#28c;color:#fff;border:0;border-radius:4px;cursor:pointer}}\
 input.q{{width:320px}}\
-pre{{background:#fff;padding:18px;box-shadow:0 1px 3px rgba(0,0,0,.08);white-space:pre-wrap;word-break:break-word;font-size:14px;line-height:1.6}}\
+pre{{background:#fff;padding:18px;box-shadow:0 1px 3px rgba(0,0,0,.08);white-space:pre-wrap;word-break:break-word;font-size:14px;line-height:1.6;max-height:70vh;overflow:auto}}\
 .meta{{background:#fff;padding:12px 18px;box-shadow:0 1px 3px rgba(0,0,0,.08);margin-bottom:14px;font-size:13px}}\
 .meta b{{color:#555}}\
 .badge{{display:inline-block;background:#eef;padding:2px 8px;border-radius:10px;margin-left:6px;font-size:12px}}\
+.range{{color:#666;font-size:13px;margin:0 0 10px}}\
+.pager{{display:flex;gap:16px;align-items:center;font-size:13px;color:#666;margin-top:14px;flex-wrap:wrap}}\
+.pager form{{display:inline-flex;gap:6px;align-items:center;margin:0}}\
+.pager input{{width:60px;padding:4px 6px;border:1px solid #ccc;border-radius:4px}}\
+.pager select{{padding:4px 6px;border:1px solid #ccc;border-radius:4px;background:#fff}}\
+.pager button{{padding:5px 12px;background:#28c;color:#fff;border:0;border-radius:4px;cursor:pointer}}\
+.pager .disabled{{color:#bbb}}\
 h2{{font-size:16px;margin:24px 0 10px}}\
 </style></head><body>\
 <header><span class=\"brand\">semdoc</span><a href=\"/ui\">Documents</a><a href=\"/ui/search\">Search</a></header>\
@@ -883,9 +894,12 @@ async fn ui_index(
     State(state): State<Arc<AppState>>,
     AxumQuery(params): AxumQuery<std::collections::HashMap<String, String>>,
 ) -> Result<axum::response::Html<String>, (StatusCode, String)> {
-    let page: usize = params.get("page").and_then(|p| p.parse().ok()).unwrap_or(1).max(1);
-    let size = 50usize;
-    let offset = (page - 1) * size;
+    let page_req: usize = params.get("page").and_then(|p| p.parse().ok()).unwrap_or(1).max(1);
+    let size: usize = params
+        .get("size")
+        .and_then(|s| s.parse().ok())
+        .filter(|&n| n >= 1 && n <= 200)
+        .unwrap_or(20);
 
     // Mongo-style filter compiled server-side from the query params that
     // match declared [fields] — same DSL the API uses.
@@ -901,6 +915,19 @@ async fn ui_index(
         let pred = semdocs::query::Pred::from_json(&Value::Object(filter_obj)).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
         Some(pred.compile(&state.mcp.engine.config).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?)
     };
+
+    // Count all matching rows first — the pager shows totals and the
+    // requested page is clamped into range.
+    let total = state
+        .mcp
+        .engine
+        .store
+        .count_parents_filtered(filter_sql.as_deref())
+        .await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    let total_pages = total.div_ceil(size).max(1);
+    let page = page_req.min(total_pages);
+    let offset = (page - 1) * size;
 
     // List with the filter, count all matching for pagination.
     let docs = state
@@ -931,10 +958,11 @@ async fn ui_index(
     for d in &docs {
         let short_id = if d.id.len() >= 12 { &d.id[..12] } else { &d.id };
         let mut cells = format!(
-            "<td><a href=\"/ui/doc/{}\" title=\"{}\">{}</a></td><td>{}</td>",
+            "<td><a href=\"/ui/doc/{}\" title=\"{}\">{}</a></td><td title=\"{}\">{}</td>",
             html_escape(&d.id),
             html_escape(&d.id),
             html_escape(short_id),
+            html_escape(&d.raw_text.chars().take(300).collect::<String>()),
             html_escape(&d.raw_text.chars().take(90).collect::<String>())
         );
         for name in state.mcp.engine.config.fields.keys() {
@@ -946,7 +974,10 @@ async fn ui_index(
                     other => other.to_string(),
                 })
                 .unwrap_or_default();
-            cells.push_str(&format!("<td>{}</td>", html_escape(&v)));
+            cells.push_str(&format!(
+                "<td title=\"{0}\">{0}</td>",
+                html_escape(&v)
+            ));
         }
         rows.push_str(&format!("<tr>{cells}</tr>\n"));
     }
@@ -956,8 +987,9 @@ async fn ui_index(
     }
     header.push_str("</tr>");
 
-    // Pagination preserving filters
-    let mut qs: Vec<String> = params
+    // Pagination preserving filters: prev/next, page x / N, total count,
+    // and a jump form carrying the active filters as hidden inputs.
+    let qs: Vec<String> = params
         .iter()
         .filter(|(k, _)| state.mcp.engine.config.fields.contains_key(*k) && !k.is_empty())
         .map(|(k, v)| format!("{k}={}", url_encode(v)))
@@ -965,23 +997,66 @@ async fn ui_index(
     let page_nav = |p: usize, label: &str| -> String {
         let mut q = qs.clone();
         q.push(format!("page={p}"));
+        q.push(format!("size={size}"));
         format!("<a href=\"/ui?{}\">{label}</a>", q.join("&amp;"))
     };
-    let nav = match page {
-        1 => format!("{} &nbsp; {}", page_nav(page + 1, "next →"), offset + docs.len()),
-        _ if docs.len() == size => format!(
-            "{} &nbsp; page {page} &nbsp; {}",
-            page_nav(page - 1, "← prev"),
-            page_nav(page + 1, "next →")
-        ),
-        _ => format!("{} &nbsp; page {page} (end)", page_nav(page - 1, "← prev")),
+    let prev = match page {
+        1 => String::from("<span class=\"disabled\">← prev</span>"),
+        _ => page_nav(page - 1, "← prev"),
     };
-    qs.clear(); // silence unused warning path when fields empty
+    let next = match page {
+        p if p >= total_pages => String::from("<span class=\"disabled\">next →</span>"),
+        _ => page_nav(page + 1, "next →"),
+    };
+    let mut hidden = String::new();
+    for (k, v) in &params {
+        if state.mcp.engine.config.fields.contains_key(k) && !v.is_empty() {
+            hidden.push_str(&format!(
+                "<input type=\"hidden\" name=\"{}\" value=\"{}\">",
+                html_escape(k),
+                html_escape(v)
+            ));
+        }
+    }
+    // Page-size options: common steps plus the current value if it is
+    // off-step (e.g. hand-edited URL) so the select shows the truth.
+    let mut size_choices = vec![20usize, 50, 100, 200];
+    if !size_choices.contains(&size) {
+        size_choices.push(size);
+        size_choices.sort_unstable();
+    }
+    let size_opts: String = size_choices
+        .into_iter()
+        .map(|n| {
+            if n == size {
+                format!("<option value=\"{n}\" selected>{n}/page</option>")
+            } else {
+                format!("<option value=\"{n}\">{n}/page</option>")
+            }
+        })
+        .collect();
+    let nav = format!(
+        "<div class=\"pager\">{prev}<span>page {page} / {total_pages}</span>{next}\
+<span>total {total} documents</span>\
+<form method=\"get\" action=\"/ui\">{hidden}\
+<input type=\"hidden\" name=\"size\" value=\"{size}\">\
+<input type=\"number\" name=\"page\" min=\"1\" max=\"{total_pages}\" value=\"{page}\">\
+<button type=\"submit\">Go</button></form>\
+<form method=\"get\" action=\"/ui\">{hidden}\
+<select name=\"size\">{size_opts}</select>\
+<button type=\"submit\">Apply</button></form></div>"
+    );
+
+    // Range info above the table, semrag-style: "Showing X–Y of Z (page a/b)".
+    let shown_from = if total == 0 { 0 } else { (page - 1) * size + 1 };
+    let shown_to = (page * size).min(total);
+    let range = format!(
+        "<p class=\"range\">Showing {shown_from}–{shown_to} of {total} documents (page {page}/{total_pages})</p>"
+    );
 
     let body = format!(
-        "<h2>Documents <span class=\"badge\">{} shown</span></h2>{bar}\
-<table>{header}{rows}</table><p style=\"font-size:13px;color:#666\">{nav}</p>",
-        docs.len()
+        "<h2>Documents</h2>{bar}{range}\
+<table>{header}{rows}</table>{nav}"
     );
     Ok(axum::response::Html(ui_page("Documents", &body)))
 }
@@ -1001,29 +1076,60 @@ async fn ui_doc(
     let Some(rec) = rec else {
         return Err((StatusCode::NOT_FOUND, format!("document {id} not found")));
     };
-    let mut meta = format!(
-        "<div class=\"meta\"><b>id</b> {}<br><b>source_path</b> {} <b>source_type</b> {}",
-        html_escape(&rec.id),
-        html_escape(&rec.source_path),
-        html_escape(&rec.source_type)
-    );
+
+    fn kv_row(th: &str, td: &str) -> String {
+        format!(
+            "<tr><th>{}</th><td>{}</td></tr>",
+            html_escape(th),
+            html_escape(td)
+        )
+    }
+
+    let mut rows = String::new();
+    rows.push_str(&kv_row("id", &rec.id));
+    rows.push_str(&kv_row("source_path", &rec.source_path));
+    rows.push_str(&kv_row("source_type", &rec.source_type));
     if let Some(p) = &rec.parent_doc_id {
-        meta.push_str(&format!(
-            " &nbsp;<a href=\"/ui/doc/{p}\"><b>parent</b> {}…</a>",
-            html_escape(&p[..12.min(p.len())])
+        rows.push_str(&format!(
+            "<tr><th>parent_doc_id</th><td><a href=\"/ui/doc/{p}\">{}</a></td></tr>",
+            html_escape(p)
+        ));
+    }
+    rows.push_str(&kv_row("chunk_level", &rec.chunk_level.to_string()));
+    rows.push_str(&kv_row("chunk_index", &rec.chunk_index.to_string()));
+
+    // Schema-defined [fields] in declaration order, followed by any extra
+    // runtime fields that may exist in this row.
+    let schema_keys: std::collections::HashSet<_> =
+        state.mcp.engine.config.fields.keys().cloned().collect();
+    for (k, fc) in &state.mcp.engine.config.fields {
+        let v = rec.extra.get(k).map(|v| match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        });
+        rows.push_str(&kv_row(
+            k,
+            &v.unwrap_or_else(|| {
+                if fc.r#type == "string" {
+                    String::new()
+                } else {
+                    "null".to_string()
+                }
+            }),
         ));
     }
     for (k, v) in &rec.extra {
-        meta.push_str(&format!(
-            "<br><b>{}</b> {}",
-            html_escape(k),
-            html_escape(&match v {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            })
-        ));
+        if schema_keys.contains(k) {
+            continue;
+        }
+        let s = match v {
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+        rows.push_str(&kv_row(k, &s));
     }
-    meta.push_str("</div>");
+
+    let meta = format!("<table class=\"kv\">{}</table>", rows);
     let text = if rec.chunk_level == 0 && rec.raw_text.chars().count() > 40_000 {
         format!("{}\n\n… (truncated at 40k chars)", rec.raw_text.chars().take(40_000).collect::<String>())
     } else {
