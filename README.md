@@ -119,6 +119,31 @@ values are type-checked against the schema, so `{"priority": "high"}`
 is an error, not a silent no-match. Raw SQL exists as a local-only
 escape hatch and is never exposed over the network.
 
+## Configuration
+
+Two files, two lifecycles — never merged:
+
+| File | Holds | Travels with the DB? |
+|---|---|---|
+| `schema.toml` | **Library semantics**: `[table]`, `[vector]`, `[fields]`, `[plugins.graph]` | **Yes** — copied to `<db>/schema.toml` at `init`, that copy wins |
+| `Config.toml` | **Deployment facts**: `[embedding]`, `[rerank]`, `[chunk]`, `[server]`, `[tls]` | No — follows the environment |
+
+Each concern has exactly one source of truth:
+
+- **rerank** lives only in `Config.toml [rerank]` (pure query-time
+  concern; schema.toml declares nothing about it)
+- **graph** lives only in `<db>/schema.toml [plugins.graph]` (the
+  lightrag mirror is content-coupled: writes/deletes cascade into it)
+- a `Config.toml` that accidentally carries schema sections
+  (`[table]`/`[vector]`/`[fields]`/`[plugins]`) loads fine but each
+  section is named in a startup warning — it has no runtime effect
+
+Resolution order: `--config <path>` > `$SEMDOC_CONFIG` > `./Config.toml`
+> built-in defaults; priority: CLI flag > `SEMDOC_*` env vars >
+`Config.toml` > defaults. Secrets never touch disk: config files only
+hold `*_env` (the name of an env var), the value stays in the
+environment.
+
 ## Docs
 
 - [中文文档 README_ZH.md](README_ZH.md) — full reference: config files,

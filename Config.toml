@@ -1,93 +1,25 @@
 # =============================================================================
-# semdoc 全量配置模板
+# semdoc 部署配置(Config.toml)
 # =============================================================================
-# 本文件包含两类配置。实际使用时按需拆成两个文件:
+# 本文件只包含部署事实——跟环境走,不随库迁移:
 #
-#   1. schema.toml  — 库语义([table]/[vector]/[fields]/[plugins])
-#                     跟数据库走,`semdoc init` 时拷贝进 <db>/schema.toml
-#   2. Config.toml  — 部署事实([embedding]/[rerank]/[chunk]/[server]/[tls])
-#                     跟环境走,不随库迁移
+#   [embedding]  嵌入后端(endpoint/model)
+#   [rerank]     重排后端(endpoint/model)
+#   [chunk]      分块参数
+#   [server]     HTTP server 监听与鉴权
+#   [tls]        出站 HTTPS 证书策略
+#
+# 库语义([table]/[vector]/[fields]/[plugins.graph])全部放在 schema.toml,
+# `semdoc init` 时拷贝进 <db>/schema.toml,之后以库内那份为准。
+# 若本文件误写 schema 节,加载时会逐条点名警告(运行时不生效)。
 #
 # 查找顺序: --config <path> > $SEMDOC_CONFIG > ./Config.toml > 默认值+env
 # 优先级:   CLI flag > 环境变量 > 本文件 > 内置默认
 # 密钥:     本文件只写 *_env(环境变量名),值本身放环境变量
 # =============================================================================
 
-
-# =============================================================================
-# 第一部分:schema.toml(库语义)
-# =============================================================================
-
-[table]
-# LanceDB 表名(每库一表)
-# 默认: "documents"
-name = "documents"
-
 # ---------------------------------------------------------------------------
-# 向量列定义。未写 [vector] 时自动派生单列:
-#   dense_vec, dim=默认 embedder 维度(1024), source="raw_text",
-#   metric="cosine", index="none", auto_embed=true
-# 支持多向量列(多路检索)。
-# ---------------------------------------------------------------------------
-[[vector.fields]]
-# 列名(不可与保留列/其他字段冲突)
-name = "dense_vec"
-# 向量维度,必须与嵌入模型输出一致(init 时校验)
-# 必填
-dim = 1024
-# 嵌入来源: "raw_text" 或 [fields] 中 type="text" 的字段
-# 必填
-source = "raw_text"
-# 距离度量: "cosine"(默认) | "l2" | "dot"
-metric = "cosine"
-# 向量索引: "none"(默认,暴力检索,中小库推荐) | "ivf_pq" | "ivf_flat"
-index = "none"
-# 写入时自动嵌入;false = 只接受客户端预嵌入
-# 默认: true
-auto_embed = true
-
-# ---------------------------------------------------------------------------
-# 用户自定义标量字段。全部可选——不需要就不写。
-# 类型: string | text | bool | int64 | float32 | timestamp | list<string>
-#   string       短元数据,可等值/范围过滤,可建索引
-#   text         长文本,FTS 检索,可作向量 source,不可建标量索引
-#   list<string> 数组,$in/$nin 成员过滤
-# ---------------------------------------------------------------------------
-[fields]
-# domain = { type = "string",  index = true }              # index 默认 false
-# score  = { type = "float32" }                            # required 默认 false
-# tags   = { type = "list<string>" }
-# notes  = { type = "text" }                               # 不可 index = true
-
-# ---------------------------------------------------------------------------
-# 图检索插件。不写 = 禁用(query_graph 类查询降级 semantic)。
-# 注意:graph 配置只在 schema.toml 声明(随库走,增删会级联镜像),
-#       运行时只读库内 <db>/schema.toml——本文件中的 [plugins.*] 节
-#       仅作为 init 草稿被拷贝,不会产生任何"覆盖"效果。
-# ---------------------------------------------------------------------------
-# backend = "lightrag-server"(HTTP,零 Python)| "lightrag-embedded"(PyO3,需 feature)
-[plugins.graph]
-backend = "lightrag-server"
-# 必填(lightrag-server)
-endpoint = "http://127.0.0.1:9727"
-# 密钥的环境变量名(可选用)
-# api_key_env = "LIGHTRAG_API_KEY"
-# 查询超时秒数
-# 默认: 60
-query_timeout_secs = 60
-# 后台 insert 并发上限
-# 默认: 4
-insert_concurrency = 4
-# lightrag-embedded 专用:工作目录
-# workspace = "./rag_storage"
-
-
-# =============================================================================
-# 第二部分:Config.toml(部署事实)
-# =============================================================================
-
-# ---------------------------------------------------------------------------
-# 嵌入后端。backend: "onnx"(默认)| "http"(OpenAI 兼容 /v1/embeddings)
+# 嵌入后端。backend: "http"(OpenAI 兼容 /v1/embeddings) | "onnx"(需 feature)
 # ---------------------------------------------------------------------------
 [embedding]
 backend = "http"
@@ -105,7 +37,8 @@ model = "bge-m3"
 # dir = "~/.cache/semdoc/models/bge-m3"
 
 # ---------------------------------------------------------------------------
-# rerank 后端。backend: "onnx"(默认)| "tei" | "openai" | "none"(禁用)
+# rerank 后端。backend: "tei" | "openai" | "onnx"(需 feature) | "none"(禁用)
+# rerank 的唯一事实源就是本节(schema.toml 不声明 rerank)。
 # ---------------------------------------------------------------------------
 [rerank]
 backend = "tei"
