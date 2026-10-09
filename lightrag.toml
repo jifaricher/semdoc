@@ -52,6 +52,14 @@ neo4j_database = "neo4j"
 
 # ---------------------------------------------------------------------------
 # LLM 绑定（实体/关系抽取 + hybrid 答案生成）
+# 合法值（lightrag_server.py 的 llm_binding 白名单）：
+#   ollama        Ollama 原生 API（host 不带 /v1，默认 http://localhost:11434）
+#   openai        任意 OpenAI 兼容端点（host 带 /v1，默认 https://api.openai.com/v1；
+#                 key 必填，无鉴权端点可填任意 dummy 值）
+#   azure_openai  Azure OpenAI（需显式配置 endpoint 与 key）
+#   gemini        Google Gemini 官方端点
+#   bedrock       AWS Bedrock（区域端点由 boto3 自动选择）
+#   lollms        默认 http://localhost:9600
 # ---------------------------------------------------------------------------
 llm_binding = "openai"
 llm_binding_host = "http://120.79.51.151:13825/v1"
@@ -60,6 +68,18 @@ llm_binding_api_key_env = "LIGHTRAG_LLM_API_KEY"   # 或直接 llm_binding_api_k
 
 # ---------------------------------------------------------------------------
 # Embedding 绑定（必须与 semdoc 的 [embedding] 同一模型，否则图谱/语义空间错位）
+# 合法值（lightrag_server.py 的 embedding_binding 白名单）：
+#   ollama        Ollama 原生 API（host 不带 /v1，默认 http://localhost:11434）
+#   openai        任意 OpenAI 兼容端点（host 带 /v1，默认 https://api.openai.com/v1；
+#                 key 必填，无鉴权端点如本地 Ollama/vLLM 可填任意 dummy 值）
+#   azure_openai  Azure OpenAI（需显式配置 endpoint 与 key）
+#   jina          默认 https://api.jina.ai/v1/embeddings
+#   gemini        Google Gemini 官方端点
+#   voyageai      Voyage AI 官方端点
+#   bedrock       AWS Bedrock（区域端点由 boto3 自动选择）
+#   lollms        默认 http://localhost:9600
+# 本部署可用 ollama（原生 API），也可改 openai + host = "...:11434/v1"，
+# 与 semdoc [embedding] 走同一条 /v1/embeddings 路径，二者向量一致。
 # ---------------------------------------------------------------------------
 embedding_binding = "ollama"
 embedding_binding_host = "http://192.168.1.7:11434"
@@ -69,6 +89,15 @@ embedding_binding_api_key_env = "LIGHTRAG_EMBEDDING_API_KEY"   # 或直接 embed
 
 # ---------------------------------------------------------------------------
 # Rerank 绑定（mix 模式查询时重排）
+# 合法值（lightrag_server.py 的 rerank_functions 表）：
+#   null     禁用 rerank（默认）
+#   cohere   任意 Cohere 兼容 /rerank 端点（TEI、vLLM、Cohere 官方）
+#            默认 model = rerank-v3.5，host = https://api.cohere.com/v2/rerank
+#   jina     默认 model = jina-reranker-v2-base-multilingual，
+#            host = https://api.jina.ai/v1/rerank
+#   aliyun   默认 model = gte-rerank-v2，
+#            host = https://dashscope.aliyuncs.com/api/v1/services/rerank/text-rerank/text-rerank
+# 本部署：本地 TEI 实现的是 Cohere 兼容 API，故用 cohere 绑定指向它。
 # ---------------------------------------------------------------------------
 rerank_binding = "cohere"
 rerank_model = "BAAI/bge-reranker-v2-m3"
