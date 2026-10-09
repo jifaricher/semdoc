@@ -76,3 +76,19 @@ pub fn apply_blocking(builder: reqwest::blocking::ClientBuilder) -> reqwest::blo
         builder
     }
 }
+
+/// Build a blocking reqwest client on a plain OS thread.
+///
+/// reqwest 0.13's blocking client construction creates and drops a temporary
+/// tokio runtime inline; doing that within an async context panics ("Cannot
+/// drop a runtime in a context where blocking is not allowed"). Every call
+/// site (CLI add/query, MCP server, semdoc-server startup) runs inside a
+/// tokio runtime, so the build must happen off it.
+pub fn build_blocking(
+    builder: reqwest::blocking::ClientBuilder,
+) -> anyhow::Result<reqwest::blocking::Client> {
+    std::thread::spawn(move || builder.build())
+        .join()
+        .map_err(|_| anyhow::anyhow!("blocking http client build thread panicked"))?
+        .map_err(|e| anyhow::anyhow!("blocking http client build: {e}"))
+}

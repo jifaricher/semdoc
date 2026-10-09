@@ -41,9 +41,10 @@ impl Remote {
         Ok(Self {
             base: base.trim_end_matches('/').to_string(),
             token,
-            http: semdocs::tls::apply_blocking(reqwest::blocking::Client::builder())
-                .timeout(std::time::Duration::from_secs(300))
-                .build()?,
+            http: semdocs::tls::build_blocking(
+                semdocs::tls::apply_blocking(reqwest::blocking::Client::builder())
+                    .timeout(std::time::Duration::from_secs(300)),
+            )?,
         })
     }
 
@@ -534,7 +535,10 @@ async fn add(
             .iter()
             .filter_map(|m| m.split_once('=').map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string()))))
             .collect();
-        remote.add(&text, &source, meta, mirror_graph)?;
+        // reqwest 0.13 blocking send panics inside an async context — run it
+        // on the blocking thread pool (same for delete/query/stats below).
+        let r = remote.clone();
+        tokio::task::spawn_blocking(move || r.add(&text, &source, meta, mirror_graph)).await??;
         println!("added (id auto-hashed from content)");
         return Ok(());
     }
@@ -640,7 +644,8 @@ async fn delete(
 ) -> Result<()> {
     if let Some(url) = server {
         let remote = Remote::new(&url, token.or_else(|| std::env::var("SEMDOC_TOKEN").ok()))?;
-        remote.delete(&id)?;
+        let (r, id2) = (remote.clone(), id.clone());
+        tokio::task::spawn_blocking(move || r.delete(&id2)).await??;
         println!("deleted {id}");
         return Ok(());
     }
@@ -826,7 +831,8 @@ async fn query(
                 body["recall_k"] = serde_json::json!(k);
             }
         }
-        let docs = remote.query(endpoint, body)?;
+        let r = remote.clone();
+        let docs = tokio::task::spawn_blocking(move || r.query(endpoint, body)).await??;
         for r in &docs {
             println!("{}", serde_json::to_string_pretty(r)?);
             println!("---");
@@ -875,7 +881,9 @@ async fn query(
 async fn stats(db: Option<String>, server: Option<String>, token: Option<String>) -> Result<()> {
     if let Some(url) = server {
         let remote = Remote::new(&url, token.or_else(|| std::env::var("SEMDOC_TOKEN").ok()))?;
-        println!("stats: {}", remote.stats()?);
+        let r = remote.clone();
+        let s = tokio::task::spawn_blocking(move || r.stats()).await??;
+        println!("stats: {s}");
         return Ok(());
     }
     let db = db.expect("clap: db or server required");

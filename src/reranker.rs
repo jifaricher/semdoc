@@ -193,13 +193,14 @@ pub use onnx_impl::OnnxReranker;
 // ---------------------------------------------------------------------------
 
 fn http_client(timeout_secs: u64) -> reqwest::blocking::Client {
-    crate::tls::apply_blocking(
-        reqwest::blocking::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(timeout_secs))
-            .pool_idle_timeout(Duration::from_secs(0)),
+    crate::tls::build_blocking(
+        crate::tls::apply_blocking(
+            reqwest::blocking::Client::builder()
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_secs(timeout_secs))
+                .pool_idle_timeout(Duration::from_secs(0)),
+        ),
     )
-    .build()
     .expect("reranker http client build")
 }
 

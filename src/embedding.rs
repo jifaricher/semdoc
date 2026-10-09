@@ -3,11 +3,11 @@
 //! (OpenAI-compatible `/v1/embeddings`).
 //!
 //! The embedder is constructed from env vars (feature parity with semrag):
-//! - `SEMDOC_EMBEDDER_BACKEND` = `onnx` (default) | `http`
-//! - onnx: model dir via `SEMDOC_EMBEDDER_DIR` (default
-//!   `~/.cache/semdoc/models/bge-m3`)
+//! - `SEMDOC_EMBEDDER_BACKEND` = `http` (default) | `onnx`
 //! - http: `SEMDOC_EMBEDDER_HTTP_URL` (base incl. `/v1`),
 //!   `SEMDOC_EMBEDDER_HTTP_MODEL`, optional `SEMDOC_EMBEDDER_HTTP_API_KEY`
+//! - onnx: model dir via `SEMDOC_EMBEDDER_DIR` (default
+//!   `~/.cache/semdoc/models/bge-m3`)
 
 use anyhow::Result;
 
@@ -219,13 +219,14 @@ pub struct HttpEmbedder {
 impl HttpEmbedder {
     /// `url` is the base URL including `/v1`; POSTs to `{url}/embeddings`.
     pub fn new(url: &str, model: &str, api_key: Option<String>) -> Self {
-        let http = crate::tls::apply_blocking(reqwest::blocking::Client::builder())
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .timeout(std::time::Duration::from_secs(60))
-            .pool_idle_timeout(std::time::Duration::from_secs(90))
-            .pool_max_idle_per_host(64)
-            .build()
-            .expect("http client build");
+        let http = crate::tls::build_blocking(
+            crate::tls::apply_blocking(reqwest::blocking::Client::builder())
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .timeout(std::time::Duration::from_secs(60))
+                .pool_idle_timeout(std::time::Duration::from_secs(90))
+                .pool_max_idle_per_host(64),
+        )
+        .expect("http client build");
         Self { http, url: url.to_string(), model: model.to_string(), api_key }
     }
 
