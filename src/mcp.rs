@@ -159,155 +159,155 @@ impl Server {
                 parts.push(format!("{k}({})", fc.r#type));
             }
             if parts.is_empty() {
-                "此库 [fields] 为空，无可更新字段".to_string()
+                "this database declares no [fields] — nothing is updatable".to_string()
             } else {
-                format!("可用字段及类型: {}", parts.join(", "))
+                format!("available fields and types: {}", parts.join(", "))
             }
         };
         json!({
             "tools": [
                 {
                     "name": "query_semantic",
-                    "description": "语义检索：向量 ANN 在叶子 chunk（约512字符）上执行，再按 expand_to 展开（small-to-big）。默认返回命中的 chunk 本身，precision 优先；需要整篇文档时用 parent_doc_id + get_document。",
+                    "description": "Semantic search: vector ANN runs over leaf chunks (~512 chars), then expands per expand_to (small-to-big). Returns the matched chunks themselves by default (precision-first); for whole documents use parent_doc_id + get_document.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "text": { "type": "string", "description": "查询文本（自然语言）" },
-                            "limit": { "type": "integer", "default": 10, "description": "返回条数上限，最大 200" },
-                            "expand_to": { "type": "string", "enum": ["chunk", "parent", "auto"], "default": "chunk", "description": "chunk=只返回命中 chunk；parent=命中所在的整篇父文档（按父 id 去重）；auto=同一父文档命中≥2个 chunk 时返回父文档，否则返回命中±1相邻 chunk 的合并窗口" },
-                            "filter": { "type": "object", "description": format!("Mongo 风格过滤，作用于向量检索之前（ANN pre-filter）。本库 schema 字段: {filter_desc}。支持算子: $eq,$ne,$in,$nin,$gt,$gte,$lt,$lte,$exists,$and,$or。") }
+                            "text": { "type": "string", "description": "Query text (natural language)" },
+                            "limit": { "type": "integer", "default": 10, "description": "Max results to return, up to 200" },
+                            "expand_to": { "type": "string", "enum": ["chunk", "parent", "auto"], "default": "chunk", "description": "chunk=return only the matched chunks; parent=return the whole parent document of each hit (deduplicated by parent id); auto=return the parent document when >=2 chunks of the same parent hit, otherwise a merged window of the hit plus/minus 1 adjacent chunks" },
+                            "filter": { "type": "object", "description": format!("Mongo-style filter applied before vector search (ANN pre-filter). Schema fields in this database: {filter_desc}. Supported operators: $eq,$ne,$in,$nin,$gt,$gte,$lt,$lte,$exists,$and,$or.") }
                         },
                         "required": ["text"]
                     }
                 },
                 {
                     "name": "query_text",
-                    "description": "全文检索（BM25 FTS）：对 raw_text 做关键词匹配，适合精确术语、函数名、错误码等词法召回，与语义检索互补。",
+                    "description": "Full-text search (BM25 FTS): keyword matching over raw_text. Best for exact terms, function names, error codes and other lexical recall; complements semantic search.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "text": { "type": "string", "description": "查询关键词/短语" },
+                            "text": { "type": "string", "description": "Query keywords/phrase" },
                             "limit": { "type": "integer", "default": 10 },
-                            "filter": { "type": "object", "description": "Mongo 风格过滤（同 query_semantic）" }
+                            "filter": { "type": "object", "description": "Mongo-style filter (same as query_semantic)" }
                         },
                         "required": ["text"]
                     }
                 },
                 {
                     "name": "query_reranked",
-                    "description": "语义检索 + cross-encoder 精排：先 ANN 过召回 80 条叶子 chunk，再用 reranker（bge-reranker-v2-m3 等）对 query-doc 对逐一打分重排。精度最高但最慢；未启用 --rerank 或 reranker 故障时自动降级为普通语义序。",
+                    "description": "Semantic search + cross-encoder reranking: ANN first recalls 80 leaf chunks, then a reranker (e.g. bge-reranker-v2-m3) scores each query-doc pair and reorders them. Highest precision, slowest. Falls back to plain semantic order when --rerank is not enabled or the reranker fails.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "text": { "type": "string", "description": "查询文本" },
+                            "text": { "type": "string", "description": "Query text" },
                             "limit": { "type": "integer", "default": 10 },
-                            "recall_k": { "type": "integer", "default": 80, "description": "送精排的候选池大小（>= limit）。调小可线性降低 rerank 耗时（80 候选约 20s+，10 候选约 3s），代价是召回略降" },
-                            "filter": { "type": "object", "description": "Mongo 风格过滤（同 query_semantic）" }
+                            "recall_k": { "type": "integer", "default": 80, "description": "Candidate pool size sent to the reranker (>= limit). Smaller values cut rerank latency roughly linearly (~20s+ for 80 candidates, ~3s for 10) at a slight recall cost" },
+                            "filter": { "type": "object", "description": "Mongo-style filter (same as query_semantic)" }
                         },
                         "required": ["text"]
                     }
                 },
                 {
                     "name": "query_graph",
-                    "description": "图谱检索（lightrag 后端）。默认 synthesize=false：返回结构化图谱数据（实体/关系/来源 chunk，即 lightrag /query/data 的原样输出）+ 由图谱 chunk 映射回本库的本地文档（快，~9s，无答案生成）。synthesize=true：让 LLM 基于图谱合成一段自然语言答案（慢，未缓存 27-60s，随答案长度增长；同问题重复查询命中 lightrag 缓存后 ~9s）。图谱后端不可用时自动降级为语义检索（响应含 degraded:true）。",
+                    "description": "Graph retrieval (lightrag backend). Default synthesize=false: returns structured graph data (entities/relations/source chunks — the raw output of lightrag /query/data) plus local documents mapped from graph chunks back to this database (fast, ~9s, no answer generation). synthesize=true: the LLM synthesizes a natural-language answer from the graph (slow, 27-60s uncached, growing with answer length; a repeated identical query hits the lightrag cache at ~9s). Automatically degrades to semantic search when the graph backend is unavailable (response carries degraded:true).",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "text": { "type": "string", "description": "查询文本" },
+                            "text": { "type": "string", "description": "Query text" },
                             "limit": { "type": "integer", "default": 10 },
-                            "synthesize": { "type": "boolean", "description": "false（默认）：返回结构化图谱数据 + 映射文档（快，agent 应自行解析 entities/relationships/documents）；true：额外调用 LLM 生成自然语言答案（慢 27-60s，适合人类直接阅读；重复问题命中缓存后 ~9s）" },
-                            "chunk_top_k": { "type": "integer", "description": "图谱层：lightrag 召回的 chunk 数（默认 20），调小更快" },
-                            "max_entity_tokens": { "type": "integer", "description": "图谱层：实体上下文 token 预算（默认 6000）" },
-                            "max_relation_tokens": { "type": "integer", "description": "图谱层：关系上下文 token 预算（默认 8000）" },
-                            "max_total_tokens": { "type": "integer", "description": "图谱层：总上下文 token 预算（默认 30000）" },
-                            "filter": { "type": "object", "description": "Mongo 风格过滤；data 模式作用于映射出的本地文档，降级模式作用于语义检索" }
+                            "synthesize": { "type": "boolean", "description": "false (default): return structured graph data + mapped documents (fast; the agent should parse entities/relationships/documents itself). true: additionally call the LLM for a natural-language answer (slow, 27-60s; better for direct human reading; repeated questions hit the cache at ~9s)" },
+                            "chunk_top_k": { "type": "integer", "description": "Graph layer: chunks recalled by lightrag (default 20); smaller is faster" },
+                            "max_entity_tokens": { "type": "integer", "description": "Graph layer: entity context token budget (default 6000)" },
+                            "max_relation_tokens": { "type": "integer", "description": "Graph layer: relation context token budget (default 8000)" },
+                            "max_total_tokens": { "type": "integer", "description": "Graph layer: total context token budget (default 30000)" },
+                            "filter": { "type": "object", "description": "Mongo-style filter; in data mode it applies to the mapped local documents, in degraded mode to the semantic search" }
                         },
                         "required": ["text"]
                     }
                 },
                 {
                     "name": "query_hybrid",
-                    "description": "混合检索：语义（reranked）与图谱并行查询，按文档 id 合并去重——图谱结果在前（宏观关联），语义结果在后（佐证细节）。synthesize=true 时图谱侧额外调用 LLM 生成自然语言答案（慢）。适合需要'既有图谱多跳关系、又有原文依据'的问题。",
+                    "description": "Hybrid retrieval: semantic (reranked) and graph queries run in parallel, merged and deduplicated by document id — graph results first (macro-level associations), semantic results after (supporting details). With synthesize=true the graph side additionally calls the LLM for a natural-language answer (slow). Best for questions needing both multi-hop graph relations and source-text evidence.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "text": { "type": "string", "description": "查询文本" },
+                            "text": { "type": "string", "description": "Query text" },
                             "limit": { "type": "integer", "default": 10 },
-                            "synthesize": { "type": "boolean", "description": "图谱侧：false（默认）=结构化图谱数据（快）；true=LLM 综合答案（慢 27-60s）" },
-                            "chunk_top_k": { "type": "integer", "description": "图谱层：lightrag 召回 chunk 数（默认 20）" },
-                            "max_entity_tokens": { "type": "integer", "description": "图谱层：实体 token 预算（默认 6000）" },
-                            "max_relation_tokens": { "type": "integer", "description": "图谱层：关系 token 预算（默认 8000）" },
-                            "max_total_tokens": { "type": "integer", "description": "图谱层：总 token 预算（默认 30000）" },
-                            "filter": { "type": "object", "description": "Mongo 风格过滤（作用于语义侧）" }
+                            "synthesize": { "type": "boolean", "description": "Graph side: false (default) = structured graph data (fast); true = LLM-synthesized answer (slow, 27-60s)" },
+                            "chunk_top_k": { "type": "integer", "description": "Graph layer: chunks recalled by lightrag (default 20)" },
+                            "max_entity_tokens": { "type": "integer", "description": "Graph layer: entity token budget (default 6000)" },
+                            "max_relation_tokens": { "type": "integer", "description": "Graph layer: relation token budget (default 8000)" },
+                            "max_total_tokens": { "type": "integer", "description": "Graph layer: total token budget (default 30000)" },
+                            "filter": { "type": "object", "description": "Mongo-style filter (applies to the semantic side)" }
                         },
                         "required": ["text"]
                     }
                 },
                 {
                     "name": "get_document",
-                    "description": "按 id 精查一条记录（叶子 chunk 或父文档），返回完整 raw_text（查询结果的 raw_text 截断在 2000 字符，此工具不截断）。传叶子 chunk 的 parent_doc_id 可获取其整篇父文档。",
+                    "description": "Fetch one record by id (leaf chunk or parent document) and return its full raw_text (query results truncate raw_text at 2000 chars; this tool does not). Pass a leaf chunk's parent_doc_id to get its whole parent document.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "id": { "type": "string", "description": "文档 id（来自查询结果或 add_document 返回值）" }
+                            "id": { "type": "string", "description": "Document id (from query results or the add_document return value)" }
                         },
                         "required": ["id"]
                     }
                 },
                 {
                     "name": "add_document",
-                    "description": "写入一篇文档：自动切块（parent + 叶子 chunk）、自动向量化（schema 声明的 auto_embed 向量列）并入库；默认不写入 lightrag 图谱，仅当 graph=true 且库配置了图谱插件时才同步镜像（实体抽取异步进行，失败只告警不影响入库）。返回文档 id（blake3(全文)）。重复添加相同文本为幂等 upsert：同 id 覆盖旧 parent+chunks 并自动重嵌入——也是修改正文后刷新向量的正确方式。",
+                    "description": "Add a document: automatically chunked (parent + leaf chunks), vectorized (auto_embed vector columns declared in the schema) and stored. Not written to the lightrag graph by default; mirrored only when graph=true and the database has a graph plugin configured (entity extraction is async; failures only warn and do not affect ingestion). Returns the document id (blake3 of the full text). Re-adding identical text is an idempotent upsert: the same id overwrites the old parent+chunks and re-embeds automatically — also the correct way to refresh vectors after editing content.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "text": { "type": "string", "description": "文档正文（markdown 或纯文本）" },
-                            "source_path": { "type": "string", "description": "来源路径标签（如文件路径），建议必填以便追溯" },
-                            "source_type": { "type": "string", "description": "来源形态（file/text/directory/glob 等，默认 text）" },
-                            "language": { "type": "string", "description": "语言提示（markdown 时按标题切分）" },
-                            "metadata": { "type": "object", "description": format!("schema 字段值（键值对）。本库字段: {filter_desc}。类型须匹配（int64 传整数、bool 传布尔、list<string> 传数组）。") },
-                            "graph": { "type": "boolean", "default": false, "description": "是否同步镜像到 lightrag 图谱（需库已配置图谱插件；实体抽取异步，失败只告警）。默认 false 不写入图谱" }
+                            "text": { "type": "string", "description": "Document body (markdown or plain text)" },
+                            "source_path": { "type": "string", "description": "Source path label (e.g. file path); strongly recommended for traceability" },
+                            "source_type": { "type": "string", "description": "Source kind (file/text/directory/glob etc., default text)" },
+                            "language": { "type": "string", "description": "Language hint (markdown is split by headings)" },
+                            "metadata": { "type": "object", "description": format!("Schema field values (key-value pairs). Fields in this database: {filter_desc}. Types must match (int64 takes integers, bool takes booleans, list<string> takes arrays).") },
+                            "graph": { "type": "boolean", "default": false, "description": "Whether to also mirror into the lightrag graph (requires a graph plugin configured on the database; entity extraction is async, failures only warn). Default false: not written to the graph" }
                         },
                         "required": ["text"]
                     }
                 },
                 {
                     "name": "delete_document",
-                    "description": "按 id 删除文档，级联清理：LanceDB 中该父文档 + 全部叶子 chunk；若配置了图谱插件则同步删除 lightrag 中的对应文档（内部 id=md5(file_source) 自动推导，同时兼容原始 id；lightrag pipeline busy 时会报错，可稍后重试）。传叶子 chunk 的 parent_doc_id 即可删整篇。",
+                    "description": "Delete a document by id with cascade cleanup: the parent document + all leaf chunks in LanceDB; when a graph plugin is configured, the corresponding lightrag document is deleted too (the internal id = md5(file_source) is derived automatically; original ids are also accepted. A busy lightrag pipeline returns an error — retry later). Pass a leaf chunk's parent_doc_id to delete the whole document.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "id": { "type": "string", "description": "文档 id（优先传父文档 id / parent_doc_id）" }
+                            "id": { "type": "string", "description": "Document id (prefer the parent document id / parent_doc_id)" }
                         },
                         "required": ["id"]
                     }
                 },
                 {
                     "name": "update_document_metadata",
-                    "description": format!("按 id 修补文档的元数据字段（原位 update，不修改 raw_text/向量列/chunk 结构，零重嵌入成本）。只接受本库 [fields] 声明的标量字段并校验类型，未提供的字段保持不变；值为 null 或空数组表示清空该字段。cascade=true（默认）时对该父文档及其全部叶子 chunk 同时生效。本库可用字段: {updatable_desc}。注意：需要修改正文时不要用本工具——正文变更请用相同文本调用 add_document（同 id 幂等 upsert，自动重嵌入）。"),
+                    "description": format!("Patch a document's metadata fields by id (in-place update; raw_text/vector columns/chunk structure untouched, zero re-embedding cost). Only scalar fields declared in this database's [fields] are accepted and type-checked; omitted fields stay unchanged; a value of null or an empty array clears the field. cascade=true (default) applies to the parent document and all its leaf chunks. Available fields: {updatable_desc}. Note: do NOT use this tool to change body text — for content changes call add_document with the new text (same-id idempotent upsert, automatic re-embedding)."),
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "id": { "type": "string", "description": "文档 id（父文档或叶子 chunk 均可）" },
-                            "metadata": { "type": "object", "description": "要更新的字段→新值键值对（须为 schema 声明的字段；值为 null 表示清空该字段）" },
-                            "cascade": { "type": "boolean", "description": "true（默认）：同时更新 parent_doc_id = id 的所有叶子 chunk；false：只更新该行" }
+                            "id": { "type": "string", "description": "Document id (parent document or leaf chunk)" },
+                            "metadata": { "type": "object", "description": "Field → new-value pairs to update (must be schema-declared fields; a null value clears the field)" },
+                            "cascade": { "type": "boolean", "description": "true (default): also update all leaf chunks with parent_doc_id = id; false: update only this row" }
                         },
                         "required": ["id", "metadata"]
                     }
                 },
                 {
                     "name": "list_documents",
-                    "description": "分页浏览库中的父文档（chunk_level=0），每条含 raw_text 前 200 字符预览。用于了解库内容、发现待删除/修补的文档 id。",
+                    "description": "Page through the parent documents in the database (chunk_level=0); each entry includes a 200-char raw_text preview. Use it to survey the database and discover document ids to delete or patch.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
-                            "limit": { "type": "integer", "default": 20, "description": "每页条数，最大 200" },
-                            "offset": { "type": "integer", "default": 0, "description": "偏移量（配合 limit 翻页）" }
+                            "limit": { "type": "integer", "default": 20, "description": "Page size, max 200" },
+                            "offset": { "type": "integer", "default": 0, "description": "Offset (use with limit for paging)" }
                         }
                     }
                 },
                 {
                     "name": "stats",
-                    "description": "知识库统计：总行数（父文档+叶子 chunk）。",
+                    "description": "Knowledge-base statistics: total row count (parent documents + leaf chunks).",
                     "inputSchema": { "type": "object", "properties": {} }
                 }
             ]
@@ -1079,7 +1079,7 @@ pub async fn handle_request(server: &Server, method: &str, params: &Value) -> Va
             "protocolVersion": "2024-11-05",
             "capabilities": { "tools": {} },
             "serverInfo": { "name": "semdoc", "version": "0.1.0" },
-            "instructions": "semdoc 知识库 MCP 服务。query_semantic 语义检索（small-to-big）；query_text 全文检索；query_reranked 精排（需 --rerank）；query_graph 图谱检索（lightrag 不可用时降级语义）；query_hybrid 混合检索；get_document 精查整篇；add_document 写入；delete_document 删除（级联图谱）；update_document_metadata 改标签不重嵌入；list_documents 分页浏览。"
+            "instructions": "semdoc knowledge-base MCP server. query_semantic: semantic search (small-to-big); query_text: full-text search; query_reranked: reranked search (requires --rerank); query_graph: graph retrieval (degrades to semantic when lightrag is unavailable); query_hybrid: hybrid retrieval; get_document: fetch a full document; add_document: ingest; delete_document: delete (cascades to the graph); update_document_metadata: edit metadata without re-embedding; list_documents: paged browsing."
         }),
         "notifications/initialized" => json!(null),
         "tools/list" => server.tools_list(),
