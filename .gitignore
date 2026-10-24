@@ -8,3 +8,4 @@ lightrag.log*
 demo.template.schema.toml
 *.template.schema.toml
 .env.local
+.mcp.json
