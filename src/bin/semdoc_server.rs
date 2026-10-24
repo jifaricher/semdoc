@@ -895,14 +895,11 @@ pre{{background:#fff;padding:18px;box-shadow:0 1px 3px rgba(0,0,0,.08);white-spa
 .pager .disabled{{color:#bbb}}\
 h2{{font-size:16px;margin:24px 0 10px}}\
 mark{{background:#ffe58f;padding:0 1px;border-radius:2px}}\
+table.chunks th:first-child,table.chunks td:first-child{{width:3.5em}}\
 .kv input{{width:95%;padding:3px 6px;border:1px solid #ccc;border-radius:3px;font-size:13px}}\
 .btn{{display:inline-block;padding:7px 16px;background:#28c;color:#fff;border:0;border-radius:4px;cursor:pointer;text-decoration:none;font-size:14px}}\
 .btn.danger{{background:#c33;padding:3px 10px;font-size:12px}}\
 .del{{margin:0}}\
-.md{{background:#fff;padding:18px;box-shadow:0 1px 3px rgba(0,0,0,.08);font-size:14px;line-height:1.6;max-height:70vh;overflow:auto}}\
-.md pre{{box-shadow:none;border:1px solid #e4e4e6;max-height:none}}\
-.md code{{font-family:ui-monospace,SFMono-Regular,monospace;font-size:12px;background:#f4f4f4;padding:1px 4px;border-radius:3px}}\
-.md pre code{{background:none;padding:0}}\
 .bar{{display:inline-block;background:#9ad;height:10px;border-radius:2px;vertical-align:middle;margin-right:8px}}\
 .muted{{color:#888;font-size:12px}}\
 </style></head><body>\
@@ -1250,8 +1247,8 @@ onsubmit=\"return confirm('Delete this document and all its chunks?')\">\
 }
 
 /// GET /ui/doc/:id — metadata table (schema fields editable in place),
-/// raw_text (markdown-rendered when language=markdown), child-chunk
-/// browser for parents, and a delete button.
+/// raw_text (plain <pre>), child-chunk browser for parents, and a delete
+/// button.
 async fn ui_doc(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1352,22 +1349,7 @@ style=\"margin-bottom:14px\">\
     } else {
         rec.raw_text.clone()
     };
-    let is_markdown = rec
-        .extra
-        .get("language")
-        .and_then(|v| v.as_str())
-        .map(|l| l.eq_ignore_ascii_case("markdown"))
-        .unwrap_or(false);
-    let body_html = if is_markdown {
-        format!(
-            "<div class=\"md\">{}</div><p class=\"muted\">rendered from markdown · \
-<a href=\"/documents/{}\">raw JSON</a></p>",
-            render_markdown(&text),
-            html_escape(&rec.id)
-        )
-    } else {
-        format!("<pre>{}</pre>", html_escape(&text))
-    };
+    let body_html = format!("<pre>{}</pre>", html_escape(&text));
 
     // Child-chunk browser (parent documents only).
     let mut chunks_html = String::new();
@@ -1391,7 +1373,7 @@ style=\"margin-bottom:14px\">\
                 ));
             }
             chunks_html = format!(
-                "<h2>Chunks ({})</h2><table><tr><th>#</th><th>text</th></tr>{rows}</table>",
+                "<h2>Chunks ({})</h2><table class=\"chunks\"><tr><th>#</th><th>text</th></tr>{rows}</table>",
                 chunks.len()
             );
         }
@@ -1902,16 +1884,6 @@ fn highlight(escaped: &str, words: &[String]) -> String {
         result.push_str(&out[i..]);
         out = result;
     }
-    out
-}
-
-/// Render markdown to HTML with inline HTML neutralized: pre-escaping
-/// keeps pulldown-cmark from passing <script> etc. straight through.
-fn render_markdown(text: &str) -> String {
-    let escaped = html_escape(text);
-    let parser = pulldown_cmark::Parser::new(&escaped);
-    let mut out = String::new();
-    pulldown_cmark::html::push_html(&mut out, parser);
     out
 }
 
